@@ -378,14 +378,28 @@ class MemorySettings:
             return 4 * 1024**3  # 4GB
         return parse_size(self.target_free_memory)
 
+    def _get_memory_ceiling(self) -> int:
+        """Get the actual memory ceiling: GPU wired limit or system RAM.
+
+        Prefers the GPU wired limit (iogpu.wired_limit_mb) since that's the
+        real Metal allocation ceiling on Apple Silicon. Falls back to system
+        RAM if unavailable.
+        """
+        gpu_limit = get_gpu_wired_limit()
+        if gpu_limit is not None:
+            return gpu_limit
+        return get_system_memory()
+
     def get_max_process_memory_bytes(self) -> int | None:
         """
         Get max process memory in bytes, or None if disabled.
 
-        - "auto": system RAM minus adaptive reserve (20%, clamped 2-8GB)
-        - "gpu": macOS GPU wired limit (iogpu.wired_limit_mb)
+        - "auto": when pressure management is enabled, uses the full memory
+          ceiling (GPU wired limit or system RAM) since zones provide safety.
+          When disabled, subtracts an adaptive reserve (20%, clamped 2-8GB).
+        - "gpu": always uses the full GPU wired limit (no reserve)
         - "disabled": None (no enforcement)
-        - "XX%": percentage of system RAM (10-99%)
+        - "XX%": percentage of memory ceiling (10-99%)
 
         Returns:
             Max process memory in bytes, or None if disabled.
@@ -394,19 +408,21 @@ class MemorySettings:
         if value == "disabled":
             return None
         if value == "auto":
-            total = get_system_memory()
-            reserve = _adaptive_system_reserve(total)
-            return total - reserve
+            ceiling = self._get_memory_ceiling()
+            if self.pressure_management_enabled:
+                # Zones provide graduated safety — no reserve needed
+                return ceiling
+            # Without zones, subtract reserve for CRITICAL-only enforcement
+            reserve = _adaptive_system_reserve(ceiling)
+            return ceiling - reserve
         if value == "gpu":
             gpu_limit = get_gpu_wired_limit()
             if gpu_limit is not None:
                 return gpu_limit
             logger.warning(
-                "GPU wired limit not available, falling back to auto"
+                "GPU wired limit not available, falling back to system RAM"
             )
-            total = get_system_memory()
-            reserve = _adaptive_system_reserve(total)
-            return total - reserve
+            return get_system_memory()
         # Parse percentage like "80%"
         percent_str = value.rstrip("%")
         try:
@@ -418,7 +434,7 @@ class MemorySettings:
             raise ValueError(
                 f"max_process_memory must be 10-99%, got {percent}%"
             )
-        return int(get_system_memory() * percent / 100)
+        return int(self._get_memory_ceiling() * percent / 100)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
