@@ -3,21 +3,27 @@
 Provides pre-computation memory check before allocating next prefill chunk.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 class SchedulerMemoryBudget:
     """Help scheduler estimate whether next allocation will fit within memory budget."""
-    
-    def __init__(self, hard_limit_bytes: int, soft_limit_bytes: int):
+
+    def __init__(self, hard_limit_bytes: int, soft_limit_bytes: int, evictable_bytes_fn: Optional[Callable[[], int]] = None):
         """Initialize memory budget.
-        
+
         Args:
             hard_limit_bytes: Maximum allowed memory (hard limit)
             soft_limit_bytes: Soft limit (warning threshold before hard limit)
+            evictable_bytes_fn: Optional callable returning bytes that could be
+                freed by evicting cached blocks. When provided, the hard limit
+                check uses ``hard_limit + evictable_bytes`` so prefills can
+                continue when memory exceeds the raw hard limit but fits within
+                headroom that eviction could reclaim.
         """
         self.hard_limit_bytes = hard_limit_bytes
         self.soft_limit_bytes = soft_limit_bytes
+        self.evictable_bytes_fn = evictable_bytes_fn
         self.active_memory = 0
         self.byte_count = 0
         self.max_tokens = 0
@@ -47,26 +53,30 @@ class SchedulerMemoryBudget:
     
     def budget_check(self) -> Tuple[int, int, bool, str]:
         """Check if current allocation would fit within limits.
-        
+
+        The hard limit check is widened by evictable headroom when
+        ``evictable_bytes_fn`` is set, allowing prefills to proceed when
+        memory exceeds the raw hard limit but eviction could reclaim enough
+        space. The soft limit is NOT adjusted — ProcessMemoryEnforcer still
+        receives warnings at the original threshold.
+
         Returns:
-            (soft_limit, hard_limit, fits, message)
+            (remaining_soft, remaining_hard, fits, message)
         """
+        # Effective hard limit includes evictable headroom.
+        effective_hard = self.hard_limit_bytes
+        if self.evictable_bytes_fn is not None:
+            effective_hard += self.evictable_bytes_fn()
+
         remaining_soft = self.soft_limit_bytes - self.byte_count
-        remaining_hard = self.hard_limit_bytes - self.byte_count
-        
+        remaining_hard = effective_hard - self.byte_count
+
+        fits_hard = self.byte_count <= effective_hard
         fits_soft = self.byte_count <= self.soft_limit_bytes
-        fits_hard = self.byte_count <= self.hard_limit_bytes
-        
-        bits_per_token = self.byte_count / self.max_tokens if self.max_tokens > 0 else 0
-        tokens_budget = "N/A"
-        for j, r in [(16, "float16"), (32, "float32"), (64, "bf16")]:
-            if j <= 8:
-                tokens_budget = f"{self.byte_count / bytes_per_token / i:.0f} bytes"
-        
+
         if self.byte_count > 0:
-            bits_per_token = self.byte_count / self.max_tokens if self.max_tokens > 0 else 0
-            if remaining_hard < 0:
-                return (remaining_hard, remaining_soft, False, f"{self.byte_count:.0f}/{self.hard_limit_bytes:.0f}B, too tight")
+            if not fits_hard:
+                return (remaining_soft, remaining_hard, False, f"{self.byte_count:.0f}/{effective_hard:.0f}B, too tight")
             elif fits_soft:
                 return (remaining_soft, remaining_hard, True, f"{self.byte_count:.0f}/{self.hard_limit_bytes:.0f}B, fits")
             else:

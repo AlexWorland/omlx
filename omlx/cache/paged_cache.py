@@ -1265,6 +1265,19 @@ class PagedCacheManager(CacheManager):
             return 0.0
         return 1.0 - (self.free_blocks / total)
 
+    def estimate_evictable_bytes(self, bytes_per_block: int) -> int:
+        """Estimate bytes that could be freed by evicting cached blocks.
+
+        O(1) operation — reads the free block queue counter.
+
+        Args:
+            bytes_per_block: Estimated memory per block in bytes.
+
+        Returns:
+            Estimated bytes that could be freed.
+        """
+        return self.free_block_queue.num_free_blocks * bytes_per_block
+
     def get_stats(self) -> PagedCacheStats:
         """Get current cache statistics."""
         with self._lock:
