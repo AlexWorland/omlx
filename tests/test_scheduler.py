@@ -1481,3 +1481,127 @@ class TestCacheCorruptionRecovery:
         assert scheduler._current_sampler_params is None
         # Cache should NOT be cleared (not a corruption error)
         scheduler.block_aware_cache.clear.assert_not_called()
+
+
+class TestPrefetchSchedulingGuard:
+    """Tests for the prefetch race condition guard in _schedule_waiting().
+
+    Verifies that requests with _prefetch_submitted=True are NOT popped
+    from the waiting deque by the main scheduling loop.  They must wait
+    until the prefetch consumption loop (at the top of _schedule_waiting)
+    reconstructs their cache on the next scheduling cycle.
+    """
+
+    def _make_scheduler(self, mock_model, mock_tokenizer, **config_overrides):
+        """Create a minimal Scheduler for scheduling-guard tests."""
+        config = SchedulerConfig(max_num_seqs=8, **config_overrides)
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=config,
+        )
+        # Ensure prefill is not paused (bypass memory pressure gate)
+        scheduler._prefill_paused = False
+        # No prefetcher — skip the consumption loop entirely
+        scheduler._prefetcher = None
+        return scheduler
+
+    def _make_request(self, request_id, prefetch_submitted=False, has_cache=False):
+        """Create a Request with controlled prefetch/cache state."""
+        req = Request(
+            request_id=request_id,
+            prompt=f"test prompt {request_id}",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[1, 2, 3, 4, 5],
+            num_prompt_tokens=5,
+            status=RequestStatus.WAITING,
+        )
+        req._prefetch_submitted = prefetch_submitted
+        if has_cache:
+            req.prompt_cache = [MagicMock()]  # non-None cache
+            req.cached_tokens = 3
+            req.remaining_tokens = [4, 5]
+        else:
+            req.remaining_tokens = [1, 2, 3, 4, 5]
+        return req
+
+    def test_prefetch_pending_request_stays_in_waiting(
+        self, mock_model, mock_tokenizer
+    ):
+        """Request with _prefetch_submitted=True must not be scheduled."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        req = self._make_request("req-prefetch", prefetch_submitted=True)
+        scheduler.waiting.append(req)
+        scheduler.requests[req.request_id] = req
+
+        result = scheduler._schedule_waiting()
+
+        assert result == []
+        assert len(scheduler.waiting) == 1
+        assert scheduler.waiting[0] is req
+        assert req.request_id not in scheduler.running
+        assert req.cached_tokens == 0  # never set because prefetch pending
+
+    def test_prefetch_pending_preserves_queue_order(
+        self, mock_model, mock_tokenizer
+    ):
+        """A prefetch-pending request at the front blocks later requests too.
+
+        The guard uses appendleft + break to preserve FCFS ordering.
+        A non-prefetch request behind the pending one should NOT be
+        scheduled ahead of it.
+        """
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        req_pending = self._make_request("req-pending", prefetch_submitted=True)
+        req_ready = self._make_request("req-ready", prefetch_submitted=False)
+        scheduler.waiting.append(req_pending)
+        scheduler.waiting.append(req_ready)
+        scheduler.requests[req_pending.request_id] = req_pending
+        scheduler.requests[req_ready.request_id] = req_ready
+
+        result = scheduler._schedule_waiting()
+
+        # Neither should be scheduled — pending blocks the queue
+        assert result == []
+        assert len(scheduler.waiting) == 2
+        # Order preserved: pending still at front
+        assert scheduler.waiting[0] is req_pending
+        assert scheduler.waiting[1] is req_ready
+
+    def test_non_prefetch_request_schedules_normally(
+        self, mock_model, mock_tokenizer
+    ):
+        """Request without _prefetch_submitted should schedule normally.
+
+        This is a sanity check that the guard doesn't block all requests.
+        """
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        req = self._make_request("req-normal", prefetch_submitted=False)
+        scheduler.waiting.append(req)
+        scheduler.requests[req.request_id] = req
+
+        # Mock batch_generator to accept the request
+        mock_bg = MagicMock()
+        mock_bg.insert.return_value = [42]  # returns a UID
+        scheduler.batch_generator = mock_bg
+
+        result = scheduler._schedule_waiting()
+
+        assert len(result) == 1
+        assert result[0].request_id == "req-normal"
+        assert "req-normal" in scheduler.running
+        assert len(scheduler.waiting) == 0
+
+    def test_prefill_paused_blocks_before_prefetch_check(
+        self, mock_model, mock_tokenizer
+    ):
+        """When prefill_paused=True, nothing is scheduled (including prefetch requests)."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._prefill_paused = True
+        req = self._make_request("req-paused", prefetch_submitted=True)
+        scheduler.waiting.append(req)
+
+        result = scheduler._schedule_waiting()
+
+        assert result == []
+        assert len(scheduler.waiting) == 1

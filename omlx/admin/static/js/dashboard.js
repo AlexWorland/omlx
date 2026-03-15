@@ -1132,6 +1132,26 @@
                 return Math.min(100, (am.model_memory_used / am.model_memory_max) * 100);
             },
 
+            pressureZoneColor(zone) {
+                const map = {
+                    green: 'bg-green-500',
+                    yellow: 'bg-amber-500',
+                    red: 'bg-red-500',
+                    critical: 'bg-red-700',
+                };
+                return map[zone] || 'bg-green-500';
+            },
+
+            pressureZoneBadgeClasses(zone) {
+                const map = {
+                    green: 'bg-green-100 text-green-700',
+                    yellow: 'bg-amber-100 text-amber-700',
+                    red: 'bg-red-100 text-red-700',
+                    critical: 'bg-red-200 text-red-800',
+                };
+                return map[zone] || 'bg-green-100 text-green-700';
+            },
+
             copyToClipboard(text) {
                 if (navigator.clipboard && window.isSecureContext) {
                     navigator.clipboard.writeText(text).catch(() => {

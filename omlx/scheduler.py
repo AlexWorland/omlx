@@ -2766,6 +2766,13 @@ class Scheduler:
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             request = self.waiting.popleft()
 
+            # Skip requests still waiting for async SSD prefetch.
+            # They'll be processed on the next _schedule_waiting() call
+            # after the prefetch consumption loop handles them.
+            if getattr(request, '_prefetch_submitted', False):
+                self.waiting.appendleft(request)
+                break
+
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
 
