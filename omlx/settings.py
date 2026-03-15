@@ -80,6 +80,31 @@ def _adaptive_system_reserve(total: int) -> int:
     return max(min_reserve, min(reserve, max_reserve))
 
 
+def get_gpu_wired_limit() -> int | None:
+    """
+    Read the macOS GPU wired memory limit via sysctl.
+
+    Returns:
+        GPU wired limit in bytes, or None if unavailable.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "iogpu.wired_limit_mb"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            mb = int(result.stdout.strip())
+            return mb * 1024**2
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        pass
+
+    return None
+
+
 def get_ssd_capacity(path: str | Path) -> int:
     """
     Return disk capacity in bytes for the given path.
@@ -297,7 +322,7 @@ class CacheSettings:
 class MemorySettings:
     """Process-level memory enforcement settings."""
 
-    max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
+    max_process_memory: str = "auto"  # "auto", "gpu", "disabled", or "XX%"
 
     pressure_management_enabled: bool = True  # Enable graduated pressure zones
 
@@ -357,7 +382,8 @@ class MemorySettings:
         """
         Get max process memory in bytes, or None if disabled.
 
-        - "auto": system RAM minus 8GB
+        - "auto": system RAM minus adaptive reserve (20%, clamped 2-8GB)
+        - "gpu": macOS GPU wired limit (iogpu.wired_limit_mb)
         - "disabled": None (no enforcement)
         - "XX%": percentage of system RAM (10-99%)
 
@@ -368,6 +394,16 @@ class MemorySettings:
         if value == "disabled":
             return None
         if value == "auto":
+            total = get_system_memory()
+            reserve = _adaptive_system_reserve(total)
+            return total - reserve
+        if value == "gpu":
+            gpu_limit = get_gpu_wired_limit()
+            if gpu_limit is not None:
+                return gpu_limit
+            logger.warning(
+                "GPU wired limit not available, falling back to auto"
+            )
             total = get_system_memory()
             reserve = _adaptive_system_reserve(total)
             return total - reserve

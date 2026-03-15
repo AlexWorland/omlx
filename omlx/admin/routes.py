@@ -109,7 +109,7 @@ class GlobalSettingsRequest(BaseModel):
     model_fallback: Optional[bool] = None
 
     # Memory enforcement
-    max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
+    max_process_memory: Optional[str] = None  # "auto", "gpu", "disabled", or "XX%"
 
     # Memory pressure management
     pressure_management_enabled: Optional[bool] = None
@@ -431,6 +431,17 @@ async def _apply_max_process_memory_runtime(
         total = get_system_memory()
         reserve = _adaptive_system_reserve(total)
         max_bytes = total - reserve
+    elif value == "gpu":
+        from ..settings import get_gpu_wired_limit, _adaptive_system_reserve
+
+        gpu_limit = get_gpu_wired_limit()
+        if gpu_limit is not None:
+            max_bytes = gpu_limit
+        else:
+            total = get_system_memory()
+            reserve = _adaptive_system_reserve(total)
+            max_bytes = total - reserve
+            logger.warning("GPU wired limit not available, falling back to auto")
     else:
         percent_str = value.rstrip("%")
         try:
