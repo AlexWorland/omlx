@@ -71,7 +71,7 @@ except ImportError:
 # Import Harmony adapter for gpt-oss models
 try:
     from .adapter.harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
-    from .utils.tokenizer import is_harmony_model
+    from .utils.tokenizer import is_harmony_model, is_qwen3_model
 
     HAS_HARMONY_ADAPTER = True
 except ImportError:
@@ -1002,6 +1002,13 @@ class Scheduler:
         # that are not in tokenizer.eos_token_id.
         self._generation_config_eos: Optional[Set[int]] = self._load_generation_config_eos()
 
+        # Cache Qwen3 <|endoftext|> token ID for logit suppression.
+        # Qwen3 generation_config lists <|endoftext|> as EOS but it should
+        # only be used by the base model, not in chat mode.
+        self._qwen3_endoftext_id: Optional[int] = None
+        if is_qwen3_model(self.config.model_name):
+            self._qwen3_endoftext_id = self._resolve_token_id("<|endoftext|>")
+
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
         self._align_block_size_with_rotating_window()
@@ -1294,6 +1301,17 @@ class Scheduler:
             )
         return type(cache_obj).__name__ in ("ArraysCache", "SizedArraysCache")
 
+    def _resolve_token_id(self, token_str: str) -> Optional[int]:
+        """Resolve a special token string to its ID, returning None if unknown."""
+        try:
+            token_id = self.tokenizer.convert_tokens_to_ids(token_str)
+            unk_id = getattr(self.tokenizer, "unk_token_id", None)
+            if token_id == unk_id:
+                return None
+            return token_id
+        except Exception:
+            return None
+
     def _load_generation_config_eos(self) -> Optional[Set[int]]:
         """Load EOS token IDs from generation_config.json if available."""
         try:
@@ -1314,6 +1332,19 @@ class Scheduler:
                 result = set(eos)
             else:
                 result = {eos}
+
+            # Qwen3 generation_config lists <|endoftext|> as EOS but it should
+            # only be used by the base model. In chat mode, <|im_end|> is the
+            # correct stop token. Remove <|endoftext|> to prevent early stopping.
+            if is_qwen3_model(self.config.model_name):
+                endoftext_id = self._resolve_token_id("<|endoftext|>")
+                if endoftext_id is not None and endoftext_id in result:
+                    result.discard(endoftext_id)
+                    logger.info(
+                        f"Qwen3: removed <|endoftext|> (id={endoftext_id}) "
+                        f"from generation_config EOS"
+                    )
+
             # Only return if there are tokens beyond what tokenizer already provides
             tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
             if tokenizer_eos is not None:
@@ -1480,6 +1511,17 @@ class Scheduler:
             else None,
         )
 
+        # Suppress <|endoftext|> logits for Qwen3 to prevent quantization noise
+        # from sampling the base-model EOS during chat generation.
+        if self._qwen3_endoftext_id is not None:
+            endoftext_id = self._qwen3_endoftext_id
+
+            def _suppress_endoftext(tokens, logits):
+                logits[:, endoftext_id] = -float('inf')
+                return logits
+
+            logits_processors = (logits_processors or []) + [_suppress_endoftext]
+
         stop_tokens = self._get_stop_tokens()
         # Add custom stop token IDs
         if sampling_params.stop_token_ids:
@@ -1527,6 +1569,17 @@ class Scheduler:
             if sampling_params.frequency_penalty != 0.0
             else None,
         )
+
+        # Suppress <|endoftext|> logits for Qwen3
+        if self._qwen3_endoftext_id is not None:
+            endoftext_id = self._qwen3_endoftext_id
+
+            def _suppress_endoftext(tokens, logits):
+                logits[:, endoftext_id] = -float('inf')
+                return logits
+
+            logits_processors = (logits_processors or []) + [_suppress_endoftext]
+
         return sampler, logits_processors
 
     def _ensure_batch_generator(self, sampling_params: SamplingParams) -> None:

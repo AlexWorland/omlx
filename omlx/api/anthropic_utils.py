@@ -787,7 +787,7 @@ def create_content_block_start_event(index: int, block_type: str, **kwargs) -> s
             "input": {},
         }
     elif block_type == "thinking":
-        content_block = {"type": "thinking", "thinking": ""}
+        content_block = {"type": "thinking", "thinking": "", "signature": ""}
     else:
         content_block = {"type": block_type}
 

@@ -74,7 +74,7 @@ class TestInternalDataClasses:
         req = InternalRequest(messages=messages)
 
         assert req.messages == messages
-        assert req.max_tokens == 2048
+        assert req.max_tokens is None
         assert req.temperature == 1.0
         assert req.top_p == 1.0
         assert req.top_k == 0
@@ -376,7 +376,7 @@ class TestOpenAIAdapter:
 
         internal = adapter.parse_request(request)
 
-        assert internal.max_tokens == 2048
+        assert internal.max_tokens is None
 
     def test_parse_request_with_stream_true(self, adapter):
         """Test parsing request with stream=True."""

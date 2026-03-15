@@ -78,6 +78,7 @@ from .api.anthropic_utils import (
     create_message_delta_event,
     create_message_start_event,
     create_message_stop_event,
+    create_ping_event,
     create_text_delta_event,
     create_thinking_delta_event,
     map_finish_reason_to_stop_reason,
@@ -1062,13 +1063,19 @@ async def _with_sse_keepalive(
     http_request: Optional["FastAPIRequest"] = None,
     interval: float = 10.0,
     disconnect_poll: float = 2.0,
+    anthropic: bool = False,
 ) -> AsyncIterator[str]:
-    """Wrap an SSE generator to send periodic keep-alive comments.
+    """Wrap an SSE generator to send periodic keep-alive messages.
 
     During long prefill (e.g. 90k tokens), no SSE events are emitted,
     causing clients with read timeouts (like Claude Code) to disconnect.
-    This wrapper sends SSE comments (: keep-alive) that are ignored by
-    SSE parsers but keep the HTTP connection alive.
+
+    For OpenAI streams (default), sends SSE comments (: keep-alive) that
+    are ignored by SSE parsers but keep the HTTP connection alive.
+
+    For Anthropic streams (anthropic=True), sends proper ping events
+    (event: ping) that Claude Code's SSE parser recognizes and uses to
+    reset its idle watchdog timer.
 
     When http_request is provided, also polls for client disconnect
     between prefill steps. This detects cancellation during long prefills
@@ -1078,10 +1085,11 @@ async def _with_sse_keepalive(
     ait = generator.__aiter__()
     task = None
     keepalive_elapsed = 0.0
+    keepalive_msg = create_ping_event() if anthropic else ": keep-alive\n\n"
 
     # Send initial keepalive immediately so clients with short read
     # timeouts (e.g. openclaw ~15s) don't disconnect during prefill.
-    yield ": keep-alive\n\n"
+    yield keepalive_msg
 
     try:
         while True:
@@ -1099,7 +1107,10 @@ async def _with_sse_keepalive(
                     try:
                         disconnected = await http_request.is_disconnected()
                         if disconnected:
-                            logger.info("Client disconnected during streaming (is_disconnected), cancelling")
+                            logger.info(
+                                f"Client disconnected during streaming (is_disconnected), cancelling "
+                                f"[keepalive_elapsed={keepalive_elapsed:.1f}s, anthropic={anthropic}]"
+                            )
                             task.cancel()
                             try:
                                 await task
@@ -1113,14 +1124,16 @@ async def _with_sse_keepalive(
                 keepalive_elapsed += wait_time
                 if keepalive_elapsed >= interval:
                     keepalive_elapsed = 0.0
-                    yield ": keep-alive\n\n"
+                    yield keepalive_msg
             if task.done():
                 result = task.result()
                 if result is _KEEPALIVE_SENTINEL:
+                    logger.debug("[sse-keepalive] generator finished normally")
                     return
                 yield result
     finally:
         if task is not None and not task.done():
+            logger.info("[sse-keepalive] cleanup: cancelling active task (client likely disconnected)")
             task.cancel()
             try:
                 await task
@@ -2331,6 +2344,11 @@ async def stream_anthropic_messages(
         model=request.model,
         input_tokens=scale_anthropic_tokens(estimated_input_tokens, request.model),
     )
+    logger.info(
+        f"[anthropic-stream] message_start: model={request.model}, "
+        f"input_tokens={scale_anthropic_tokens(estimated_input_tokens, request.model)} "
+        f"(raw={estimated_input_tokens}), max_tokens={kwargs.get('max_tokens')}"
+    )
 
     # 3. Stream content with thinking/content separation
     try:
@@ -2354,6 +2372,7 @@ async def stream_anthropic_messages(
                                 index=block_index, block_type="thinking"
                             )
                             thinking_block_started = True
+                            logger.info("[anthropic-stream] thinking block started")
                     if thinking_delta:
                         yield create_thinking_delta_event(
                             index=block_index, thinking=thinking_delta
@@ -2374,12 +2393,16 @@ async def stream_anthropic_messages(
                                 index=block_index, block_type="text"
                             )
                             text_block_started = True
+                            logger.info("[anthropic-stream] text block started")
                         yield create_text_delta_event(index=block_index, text=content_delta)
 
             if output.finished:
                 break
     except Exception as e:
-        logger.error(f"Error during Anthropic streaming: {e}")
+        logger.error(
+            f"[anthropic-stream] error after {time.perf_counter() - start_time:.2f}s: {e}",
+            exc_info=True,
+        )
         yield create_error_event("api_error", str(e))
         yield create_message_stop_event()
         return
@@ -2482,6 +2505,7 @@ async def stream_anthropic_messages(
     tool_block_start = block_index + 1
     if tool_calls:
         for i, tc in enumerate(tool_calls, start=tool_block_start):
+            logger.info(f"[anthropic-stream] tool_use block: {tc.function.name}")
             # Start tool_use block
             yield create_content_block_start_event(
                 index=i,
@@ -2526,6 +2550,13 @@ async def stream_anthropic_messages(
         )
 
     # 7. Send message_stop
+    logger.info(
+        f"[anthropic-stream] complete: stop_reason={stop_reason}, "
+        f"output_tokens={actual_output_tokens}, "
+        f"thinking={thinking_block_started}, text={text_block_started}, "
+        f"tools={len(tool_calls) if tool_calls else 0}, "
+        f"elapsed={time.perf_counter() - start_time:.2f}s"
+    )
     yield create_message_stop_event()
 
 
@@ -2554,10 +2585,11 @@ async def create_anthropic_message(
 
     Streaming is supported with `stream: true`.
     """
-    logger.debug(
-        f"Anthropic Messages request: model={request.model}, "
-        f"messages={len(request.messages)}, stream={request.stream}, "
-        f"max_tokens={request.max_tokens}"
+    logger.info(
+        f"[anthropic-req] model={request.model}, messages={len(request.messages)}, "
+        f"stream={request.stream}, max_tokens={request.max_tokens}, "
+        f"tools={len(request.tools) if request.tools else 0}, "
+        f"thinking={getattr(request.thinking, 'type', None) if hasattr(request, 'thinking') and request.thinking else 'none'}"
     )
 
     engine = await get_engine_for_model(request.model)
@@ -2674,6 +2706,11 @@ async def create_anthropic_message(
             )
         raise
     validate_context_window(num_prompt_tokens, request.model)
+    logger.info(
+        f"[anthropic-req] prompt_tokens={num_prompt_tokens}, "
+        f"scaled={scale_anthropic_tokens(num_prompt_tokens, request.model)}, "
+        f"max_ctx={get_max_context_window(request.model)}"
+    )
 
     # Add stop sequences
     if request.stop_sequences:
@@ -2684,6 +2721,7 @@ async def create_anthropic_message(
             _with_sse_keepalive(
                 stream_anthropic_messages(engine, messages, request, **chat_kwargs),
                 http_request=http_request,
+                anthropic=True,
             ),
             media_type="text/event-stream",
         )
@@ -2748,6 +2786,12 @@ async def create_anthropic_message(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         cleaned_thinking = extraction.cleaned_thinking
+
+    logger.info(
+        f"[anthropic-resp] thinking={len(cleaned_thinking) if cleaned_thinking else 0} chars, "
+        f"content={len(cleaned_text) if cleaned_text else len(regular_content)} chars, "
+        f"tool_calls={len(tool_calls) if tool_calls else 0}"
+    )
 
     # Convert to Anthropic response format
     response = convert_internal_to_anthropic_response(

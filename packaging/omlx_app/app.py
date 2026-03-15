@@ -557,6 +557,15 @@ class OMLXAppDelegate(NSObject):
             if stop_icon:
                 stop_item.setImage_(stop_icon)
             self.menu.addItem_(stop_item)
+
+            restart_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Restart Server", "restartServer:", ""
+            )
+            restart_item.setTarget_(self)
+            restart_icon = self._create_menu_icon("arrow.clockwise.circle")
+            if restart_icon:
+                restart_item.setImage_(restart_icon)
+            self.menu.addItem_(restart_item)
         elif status in (ServerStatus.UNRESPONSIVE, ServerStatus.ERROR):
             # Force Restart for unresponsive/errored servers
             restart_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -881,6 +890,17 @@ class OMLXAppDelegate(NSObject):
     def stopServer_(self, sender):
         """Stop the server."""
         self.server_manager.stop()
+        self._cached_stats = None
+        self._cached_alltime_stats = None
+        self._update_status_display()
+
+    @objc.IBAction
+    def restartServer_(self, sender):
+        """Graceful restart: stop then start the server."""
+        result = self.server_manager.restart()
+        if isinstance(result, PortConflict):
+            self._handle_port_conflict(result)
+            return
         self._cached_stats = None
         self._cached_alltime_stats = None
         self._update_status_display()

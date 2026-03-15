@@ -703,6 +703,106 @@ class TestSchedulerStopTokens:
         assert mock_tokenizer.eos_token_id in stop_tokens
 
 
+class TestSchedulerQwen3StopTokens:
+    """Tests for Qwen3-specific stop token filtering."""
+
+    def _make_qwen3_tokenizer(self):
+        """Create a mock tokenizer mimicking Qwen3's token layout."""
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 248046  # <|im_end|>
+        tokenizer.unk_token_id = 0
+        tokenizer.name_or_path = "/fake/path/Qwen3-8B"
+        token_map = {"<|endoftext|>": 248044, "<|im_end|>": 248046}
+        tokenizer.convert_tokens_to_ids = lambda t: token_map.get(t, 0)
+        return tokenizer
+
+    def test_qwen3_filters_endoftext_from_generation_config_eos(self, mock_model):
+        """_load_generation_config_eos removes <|endoftext|> for Qwen3 models."""
+        import json
+        import tempfile
+        import os
+
+        tokenizer = self._make_qwen3_tokenizer()
+
+        # Create a fake generation_config.json with both EOS tokens
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gc = {"eos_token_id": [248046, 248044]}
+            with open(os.path.join(tmpdir, "generation_config.json"), "w") as f:
+                json.dump(gc, f)
+            tokenizer.name_or_path = tmpdir
+
+            config = SchedulerConfig(model_name="Qwen3-8B")
+            scheduler = Scheduler(model=mock_model, tokenizer=tokenizer, config=config)
+
+            # <|endoftext|> should have been filtered out
+            stop_tokens = scheduler._get_stop_tokens()
+            assert 248046 in stop_tokens  # <|im_end|> stays
+            assert 248044 not in stop_tokens  # <|endoftext|> removed
+
+    def test_non_qwen3_keeps_all_generation_config_eos(self, mock_model):
+        """Non-Qwen3 models keep all EOS tokens from generation_config."""
+        import json
+        import tempfile
+        import os
+
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 100
+        tokenizer.unk_token_id = 0
+        token_map = {"<|endoftext|>": 200}
+        tokenizer.convert_tokens_to_ids = lambda t: token_map.get(t, 0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gc = {"eos_token_id": [100, 200]}
+            with open(os.path.join(tmpdir, "generation_config.json"), "w") as f:
+                json.dump(gc, f)
+            tokenizer.name_or_path = tmpdir
+
+            config = SchedulerConfig(model_name="llama-3.1-8b")
+            scheduler = Scheduler(model=mock_model, tokenizer=tokenizer, config=config)
+
+            stop_tokens = scheduler._get_stop_tokens()
+            assert 100 in stop_tokens
+            assert 200 in stop_tokens  # <|endoftext|> stays for non-Qwen3
+
+    def test_qwen3_caches_endoftext_id(self, mock_model):
+        """Scheduler caches _qwen3_endoftext_id for Qwen3 models."""
+        tokenizer = self._make_qwen3_tokenizer()
+        config = SchedulerConfig(model_name="Qwen3.5-35B-A3B-4bit")
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer, config=config)
+
+        assert scheduler._qwen3_endoftext_id == 248044
+
+    def test_non_qwen3_no_endoftext_id(self, mock_model, mock_tokenizer):
+        """Non-Qwen3 models have _qwen3_endoftext_id = None."""
+        config = SchedulerConfig(model_name="llama-3.1-8b")
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+
+        assert scheduler._qwen3_endoftext_id is None
+
+    def test_qwen3_logits_processor_suppresses_endoftext(self, mock_model):
+        """_build_sampler_and_processors adds <|endoftext|> suppressor for Qwen3."""
+        tokenizer = self._make_qwen3_tokenizer()
+        config = SchedulerConfig(model_name="Qwen3-8B")
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer, config=config)
+
+        params = SamplingParams(max_tokens=100)
+        _, processors = scheduler._build_sampler_and_processors(params)
+
+        assert processors is not None
+        assert len(processors) > 0
+
+        # Simulate logits — the endoftext position should be -inf after processing
+        import mlx.core as mx
+        logits = mx.zeros((1, 250000))
+        tokens = mx.array([[1]])
+        for proc in processors:
+            logits = proc(tokens, logits)
+        # Token 248044 (<|endoftext|>) should be -inf
+        assert float(logits[0, 248044]) == float('-inf')
+        # Other tokens should be unaffected
+        assert float(logits[0, 248046]) == 0.0
+
+
 class TestSchedulerFormatBytes:
     """Tests for Scheduler._format_bytes()."""
 

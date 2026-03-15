@@ -74,7 +74,7 @@ class OpenAIAdapter(BaseAdapter):
 
         return InternalRequest(
             messages=internal_messages,
-            max_tokens=request.max_tokens or 2048,
+            max_tokens=request.max_tokens,
             temperature=request.temperature if request.temperature is not None else 1.0,
             top_p=request.top_p if request.top_p is not None else 1.0,
             min_p=request.min_p if request.min_p is not None else 0.0,

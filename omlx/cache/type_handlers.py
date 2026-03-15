@@ -124,7 +124,6 @@ class CacheTypeHandler(ABC):
         """
         pass
 
-    @abstractmethod
     def reconstruct_cache(
         self,
         state: Dict[str, Any],
@@ -140,6 +139,19 @@ class CacheTypeHandler(ABC):
             Reconstructed mlx-lm cache object
         """
         pass
+
+    def estimate_memory_per_token(self, dtype_bits: int = 16) -> int:
+        """Estimate memory usage per token for this cache type.
+
+        Args:
+            dtype_bits: bits per element (default 16 for float16)
+
+        Returns:
+            bytes per token per layer (keys + values)
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement estimate_memory_per_token"
+        )
 
     def get_state_info(self) -> CacheStateInfo:
         """Get information about this cache type's state structure."""
@@ -182,7 +194,9 @@ class KVCacheHandler(CacheTypeHandler):
         return {
             "keys": keys,
             "values": values,
-            "offset": getattr(cache_obj, "offset", keys.shape[2] if keys is not None else 0),
+            "offset": getattr(
+                cache_obj, "offset", keys.shape[2] if keys is not None else 0
+            ),
             "cache_type": self.cache_type.value,
         }
 
@@ -278,6 +292,22 @@ class KVCacheHandler(CacheTypeHandler):
 
         return cache
 
+    def estimate_memory_per_token(self, dtype_bits: int = 16) -> int:
+        """Estimate memory usage per token for KVCache.
+
+        KVCache stores keys and values as 2 tensors per layer:
+        - keys: (batch, n_kv_heads, seq_len, head_dim)
+        - values: (batch, n_kv_heads, seq_len, head_dim)
+
+        For a single new token, we add:
+        - 1 KV pair per KV head = 2 floats per head_dim
+        - Total per token per layer = 2 * head_dim * (dtype_bits / 8) bytes
+
+        Since we don't know head_dim at runtime, we use a conservative
+        estimate assuming at least 1 dimension.
+        """
+        return 2 * (dtype_bits // 8)  # 1 element per direction (conservative)
+
 
 class RotatingKVCacheHandler(CacheTypeHandler):
     """Handler for RotatingKVCache (sliding window attention).
@@ -315,7 +345,9 @@ class RotatingKVCacheHandler(CacheTypeHandler):
             "keys": keys,
             "values": values,
             "offset": getattr(cache_obj, "offset", 0),
-            "max_size": getattr(cache_obj, "max_size", keys.shape[2] if keys is not None else 0),
+            "max_size": getattr(
+                cache_obj, "max_size", keys.shape[2] if keys is not None else 0
+            ),
             "keep": getattr(cache_obj, "keep", 0),
             "_idx": getattr(cache_obj, "_idx", 0),
             "meta_state": meta_state,
@@ -435,7 +467,9 @@ class RotatingKVCacheHandler(CacheTypeHandler):
 
         if hasattr(keys, "shape") and len(keys.shape) >= 3:
             seq_len = keys.shape[2]
-            _idx = min(max(0, int(_idx)), seq_len, max_size if max_size > 0 else seq_len)
+            _idx = min(
+                max(0, int(_idx)), seq_len, max_size if max_size > 0 else seq_len
+            )
 
         cache = RotatingKVCache(max_size=max_size, keep=keep)
         cache.keys = keys
@@ -447,6 +481,14 @@ class RotatingKVCacheHandler(CacheTypeHandler):
 
     def _get_meta_state_keys(self) -> Tuple[str, ...]:
         return ("keep", "max_size", "offset", "_idx")
+
+    def estimate_memory_per_token(self, dtype_bits: int = 16) -> int:
+        """Estimate memory for RotatingKVCache.
+
+        RotatingKVCache has same structure as KVCache (keys + values),
+        but uses fixed max_size. Memory per token is identical to KVCache.
+        """
+        return 2 * (dtype_bits // 8)
 
 
 class SizedArraysCache:
@@ -586,7 +628,9 @@ class ArraysCacheHandler(CacheTypeHandler):
     def extract_state(self, cache_obj: Any) -> Dict[str, Any]:
         """Extract state from ArraysCache object."""
         # Unwrap if wrapped in SizedArraysCache
-        inner = cache_obj._inner if isinstance(cache_obj, SizedArraysCache) else cache_obj
+        inner = (
+            cache_obj._inner if isinstance(cache_obj, SizedArraysCache) else cache_obj
+        )
         state_list = inner.state if hasattr(inner, "state") else inner.cache
 
         return {
@@ -656,6 +700,15 @@ class ArraysCacheHandler(CacheTypeHandler):
 
     def _get_meta_state_keys(self) -> Tuple[str, ...]:
         return ()
+
+    def estimate_memory_per_token(self, dtype_bits: int = 16) -> int:
+        """Estimate memory for ArraysCache.
+
+        ArraysCache is used for non-KV cache state (e.g., RNN hidden states,
+        MoE gating, etc.). We use the same estimate as KVCache: 2 tensors
+        (keys and values analogy) per token.
+        """
+        return 2 * (dtype_bits // 8)
 
 
 class CacheListHandler(CacheTypeHandler):
@@ -790,14 +843,20 @@ class CacheListHandler(CacheTypeHandler):
             Reconstructed CacheList object, or None on failure.
         """
         sub_states = state.get("sub_states", [])
-        if not meta_state or not isinstance(meta_state, (list, tuple)) or len(meta_state) < 2:
+        if (
+            not meta_state
+            or not isinstance(meta_state, (list, tuple))
+            or len(meta_state) < 2
+        ):
             logger.error("CacheList reconstruct: missing or invalid meta_state")
             return None
 
         class_names, sub_meta_states = meta_state[0], meta_state[1]
 
         # Validate lengths match to prevent silent zip truncation
-        if len(sub_states) != len(class_names) or len(sub_states) != len(sub_meta_states):
+        if len(sub_states) != len(class_names) or len(sub_states) != len(
+            sub_meta_states
+        ):
             logger.error(
                 f"CacheList reconstruct: length mismatch — "
                 f"sub_states={len(sub_states)}, class_names={len(class_names)}, "
@@ -808,7 +867,9 @@ class CacheListHandler(CacheTypeHandler):
         # Sanitize sub_meta_states for sub-cache types that don't support
         # meta_state (inherit _BaseCache's strict setter which rejects
         # truthy values).  Use "" to match _BaseCache.meta_state getter.
-        _NO_META_STATE_TYPES = frozenset({"KVCache", "ConcatenateKVCache", "ArraysCache"})
+        _NO_META_STATE_TYPES = frozenset(
+            {"KVCache", "ConcatenateKVCache", "ArraysCache"}
+        )
         sanitized_sub_meta_states = [
             "" if cls_name in _NO_META_STATE_TYPES else sub_meta
             for cls_name, sub_meta in zip(class_names, sub_meta_states)
@@ -818,7 +879,9 @@ class CacheListHandler(CacheTypeHandler):
         try:
             from mlx_lm.models.cache import CacheList
 
-            return CacheList.from_state(sub_states, (class_names, sanitized_sub_meta_states))
+            return CacheList.from_state(
+                sub_states, (class_names, sanitized_sub_meta_states)
+            )
         except (ImportError, AttributeError, TypeError, KeyError, Exception) as e:
             logger.debug(f"CacheList.from_state() unavailable or failed: {e}")
 
@@ -834,7 +897,9 @@ class CacheListHandler(CacheTypeHandler):
         from .type_registry import CacheTypeRegistry as _Registry  # local import
 
         sub_caches = []
-        for sub_state, cls_name, sub_meta in zip(sub_states, class_names, sub_meta_states):
+        for sub_state, cls_name, sub_meta in zip(
+            sub_states, class_names, sub_meta_states
+        ):
             # Normalize class name for handler lookup
             normalized_name = self._CLASS_NAME_NORMALIZE.get(cls_name, cls_name)
             sub_handler = _Registry.get_handler_by_class_name(normalized_name)
@@ -857,7 +922,9 @@ class CacheListHandler(CacheTypeHandler):
                         )
                         return None
             except Exception as e:
-                logger.error(f"CacheList fallback: failed to reconstruct {cls_name}: {e}")
+                logger.error(
+                    f"CacheList fallback: failed to reconstruct {cls_name}: {e}"
+                )
                 return None
 
             if sub_cache is None:

@@ -34,7 +34,7 @@ class InternalRequest:
     messages: List[InternalMessage]
 
     # Generation parameters
-    max_tokens: int = 2048
+    max_tokens: Optional[int] = None
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
