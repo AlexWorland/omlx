@@ -1080,7 +1080,7 @@ class GlobalSettings:
 
         # Memory enforcement validation
         mem_val = self.memory.max_process_memory.strip().lower()
-        if mem_val not in ("auto", "disabled"):
+        if mem_val not in ("auto", "disabled", "gpu"):
             percent_str = mem_val.rstrip("%")
             try:
                 percent = int(percent_str)
