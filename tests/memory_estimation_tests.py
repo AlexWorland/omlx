@@ -1,5 +1,6 @@
 import sys
 import os
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -8,6 +9,7 @@ from omlx.cache.type_handlers import (
     RotatingKVCacheHandler,
     ArraysCacheHandler,
 )
+from omlx.cache.scheduler_memory_budget import SchedulerMemoryBudget
 
 
 class TestKVCacheMemoryEstimation:
@@ -90,3 +92,61 @@ class TestMemoryEstimationConsistency:
             assert kv.estimate_memory_per_token(bits) == expected
             assert rot.estimate_memory_per_token(bits) == expected
             assert arr.estimate_memory_per_token(bits) == expected
+
+
+class TestSchedulerMemoryBudgetEvictable:
+    """Tests for SchedulerMemoryBudget with evictable_bytes_fn."""
+
+    def test_over_hard_limit_fits_with_eviction(self):
+        """Over hard limit but fits when accounting for evictable bytes."""
+        budget = SchedulerMemoryBudget(
+            hard_limit_bytes=1000,
+            soft_limit_bytes=800,
+            evictable_bytes_fn=lambda: 500,  # 500 bytes evictable
+        )
+        budget.byte_count = 1200  # Over hard (1000) but under effective (1500)
+        budget.max_tokens = 10
+        remaining_soft, remaining_hard, fits, msg = budget.budget_check()
+        assert fits is True  # 1200 <= 1000 + 500
+
+    def test_over_hard_limit_even_with_eviction(self):
+        """Over hard limit even with evictable headroom → doesn't fit."""
+        budget = SchedulerMemoryBudget(
+            hard_limit_bytes=1000,
+            soft_limit_bytes=800,
+            evictable_bytes_fn=lambda: 100,
+        )
+        budget.byte_count = 1200  # Over effective (1100)
+        budget.max_tokens = 10
+        remaining_soft, remaining_hard, fits, msg = budget.budget_check()
+        assert fits is False
+
+    def test_no_evictable_provider_original_behavior(self):
+        """No evictable_bytes_fn → original hard limit behavior."""
+        budget = SchedulerMemoryBudget(
+            hard_limit_bytes=1000,
+            soft_limit_bytes=800,
+        )
+        budget.byte_count = 900  # Under hard
+        budget.max_tokens = 10
+        _, _, fits, _ = budget.budget_check()
+        assert fits is True
+
+        budget.byte_count = 1100  # Over hard
+        _, _, fits, _ = budget.budget_check()
+        assert fits is False
+
+    def test_soft_limit_not_adjusted_by_evictable(self):
+        """Soft limit is NOT widened by evictable bytes."""
+        budget = SchedulerMemoryBudget(
+            hard_limit_bytes=1000,
+            soft_limit_bytes=800,
+            evictable_bytes_fn=lambda: 500,
+        )
+        budget.byte_count = 900  # Over soft (800) but under hard (1000)
+        budget.max_tokens = 10
+        remaining_soft, remaining_hard, fits, msg = budget.budget_check()
+        # Over soft limit → fits_soft is False, but fits_hard is True
+        # The method returns fits=False when over soft but under hard
+        # (because the existing code returns fits based on fits_soft in this branch)
+        assert remaining_soft < 0  # Over soft limit

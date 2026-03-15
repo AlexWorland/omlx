@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+from omlx.process_memory_enforcer import ProcessMemoryEnforcer, PressureZone
 
 
 def _make_entry(model_id, engine=None, is_loading=False, is_pinned=False):
@@ -63,6 +63,7 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_evicts_when_over_limit(self, enforcer):
         """Evicts LRU model when over limit (multiple models loaded)."""
+        enforcer._current_zone = PressureZone.CRITICAL
         # Need at least 2 loaded non-pinned models for eviction path
         engine_a = MagicMock()
         engine_a.abort_all_requests = AsyncMock(return_value=0)
@@ -93,6 +94,7 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_stops_when_all_pinned(self, enforcer):
         """Stops eviction when all models are pinned (no victim)."""
+        enforcer._current_zone = PressureZone.CRITICAL
         enforcer._engine_pool._find_lru_victim.return_value = None
         # Add a pinned loaded model so the log says "pinned"
         entry = _make_entry("pinned-model", engine=MagicMock(), is_pinned=True)
@@ -108,6 +110,7 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_evicts_multiple_models(self, enforcer):
         """Evicts multiple models in sequence until under limit."""
+        enforcer._current_zone = PressureZone.CRITICAL
         # Need 3 loaded non-pinned models for sequential eviction
         engine_a = MagicMock()
         engine_a.abort_all_requests = AsyncMock(return_value=0)
@@ -146,6 +149,7 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_aborts_loading_model_when_no_lru_victim(self, enforcer):
         """Aborts a loading model when no LRU victim is available."""
+        enforcer._current_zone = PressureZone.CRITICAL
         enforcer._engine_pool._find_lru_victim.return_value = None
         loading_entry = _make_entry(
             "loading-model", engine=None, is_loading=True
@@ -165,6 +169,7 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_evicts_lru_before_aborting_loading(self, enforcer):
         """Evicts LRU models first, then aborts loading model."""
+        enforcer._current_zone = PressureZone.CRITICAL
         # Need 2 loaded non-pinned so model-a gets evicted (not abort path)
         engine_a = MagicMock()
         engine_a.abort_all_requests = AsyncMock(return_value=0)
@@ -208,6 +213,7 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_no_models_loaded_or_loading(self, enforcer):
         """Logs correctly when no models are loaded or loading."""
+        enforcer._current_zone = PressureZone.CRITICAL
         enforcer._engine_pool._find_lru_victim.return_value = None
         enforcer._engine_pool._entries = {}
 
@@ -322,6 +328,7 @@ class TestSingleModelMemoryPressure:
     @pytest.mark.asyncio
     async def test_single_model_aborts_not_evicts(self, enforcer):
         """Scenario 2: Single model aborts requests instead of evicting."""
+        enforcer._current_zone = PressureZone.CRITICAL
         engine = MagicMock()
         engine.abort_all_requests = AsyncMock(return_value=3)
         entry = _make_entry("big-model", engine=engine)
@@ -342,6 +349,7 @@ class TestSingleModelMemoryPressure:
     @pytest.mark.asyncio
     async def test_single_model_no_active_requests(self, enforcer):
         """Scenario 2 variant: No requests to abort, model still kept."""
+        enforcer._current_zone = PressureZone.CRITICAL
         engine = MagicMock()
         engine.abort_all_requests = AsyncMock(return_value=0)
         entry = _make_entry("big-model", engine=engine)
@@ -362,6 +370,7 @@ class TestSingleModelMemoryPressure:
     @pytest.mark.asyncio
     async def test_two_models_one_inferring_evicts_idle(self, enforcer):
         """Scenario 1: Two models, only one inferring. Evict idle LRU."""
+        enforcer._current_zone = PressureZone.CRITICAL
         engine_active = MagicMock()
         engine_active.abort_all_requests = AsyncMock(return_value=0)
         engine_idle = MagicMock()
@@ -404,6 +413,7 @@ class TestSingleModelMemoryPressure:
     @pytest.mark.asyncio
     async def test_two_models_both_inferring_evict_then_abort(self, enforcer):
         """Scenario 3: Both models inferring. Evict LRU, abort remaining."""
+        enforcer._current_zone = PressureZone.CRITICAL
         engine_a = MagicMock()
         engine_a.abort_all_requests = AsyncMock(return_value=2)
         engine_b = MagicMock()
