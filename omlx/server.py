@@ -299,10 +299,16 @@ async def lifespan(app: FastAPI):
         if max_bytes is not None:
             from .process_memory_enforcer import ProcessMemoryEnforcer
 
+            memory_settings = _server_state.global_settings.memory
             enforcer = ProcessMemoryEnforcer(
                 engine_pool=_server_state.engine_pool,
                 max_bytes=max_bytes,
                 settings_manager=_server_state.settings_manager,
+                watermark_yellow=memory_settings.watermark_yellow,
+                watermark_red=memory_settings.watermark_red,
+                watermark_critical=memory_settings.watermark_critical,
+                target_free_bytes=memory_settings.get_target_free_memory_bytes(),
+                max_evict_blocks_per_cycle=memory_settings.max_evict_blocks_per_cycle,
             )
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer

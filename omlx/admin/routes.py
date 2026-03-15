@@ -2283,6 +2283,54 @@ async def get_server_stats(
 
     from ..utils.install import get_cli_prefix
 
+    # Memory pressure status from enforcer
+    server_state = _get_server_state() if _get_server_state else None
+    memory_pressure = None
+    if server_state is not None and server_state.process_memory_enforcer is not None:
+        memory_pressure = server_state.process_memory_enforcer.get_status()
+
+    # Prefetch stats aggregated across all loaded engines
+    prefetch_stats = None
+    engine_pool = _get_engine_pool()
+    if engine_pool is not None:
+        aggregated: dict = {
+            "enabled": False,
+            "active_jobs": 0,
+            "jobs_submitted": 0,
+            "jobs_completed": 0,
+            "jobs_cancelled": 0,
+            "blocks_prefetched": 0,
+            "blocks_used": 0,
+            "blocks_wasted": 0,
+            "total_read_time_ms": 0.0,
+            "fallback_count": 0,
+        }
+        found_any = False
+        for entry in engine_pool._entries.values():
+            if entry.engine is None:
+                continue
+            scheduler = getattr(entry.engine, "scheduler", None)
+            if scheduler is None:
+                continue
+            prefetcher = getattr(scheduler, "_prefetcher", None)
+            if prefetcher is None:
+                continue
+            stats = prefetcher.get_stats()
+            found_any = True
+            if stats.get("enabled"):
+                aggregated["enabled"] = True
+            aggregated["active_jobs"] += stats.get("active_jobs", 0)
+            aggregated["jobs_submitted"] += stats.get("jobs_submitted", 0)
+            aggregated["jobs_completed"] += stats.get("jobs_completed", 0)
+            aggregated["jobs_cancelled"] += stats.get("jobs_cancelled", 0)
+            aggregated["blocks_prefetched"] += stats.get("blocks_prefetched", 0)
+            aggregated["blocks_used"] += stats.get("blocks_used", 0)
+            aggregated["blocks_wasted"] += stats.get("blocks_wasted", 0)
+            aggregated["total_read_time_ms"] += stats.get("total_read_time_ms", 0.0)
+            aggregated["fallback_count"] += stats.get("fallback_count", 0)
+        if found_any:
+            prefetch_stats = aggregated
+
     return {
         **snapshot,
         "host": host,
@@ -2300,6 +2348,8 @@ async def get_server_stats(
             else 200000
         ),
         "engines": _get_engine_info(),
+        "memory_pressure": memory_pressure,
+        "prefetch_stats": prefetch_stats,
     }
 
 
