@@ -304,6 +304,7 @@ async def lifespan(app: FastAPI):
                 engine_pool=_server_state.engine_pool,
                 max_bytes=max_bytes,
                 settings_manager=_server_state.settings_manager,
+                pressure_management_enabled=memory_settings.pressure_management_enabled,
                 watermark_yellow=memory_settings.watermark_yellow,
                 watermark_red=memory_settings.watermark_red,
                 watermark_critical=memory_settings.watermark_critical,

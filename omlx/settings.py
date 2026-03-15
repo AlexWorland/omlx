@@ -299,6 +299,8 @@ class MemorySettings:
 
     max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
 
+    pressure_management_enabled: bool = True  # Enable graduated pressure zones
+
     # Watermark thresholds (fraction of max_process_memory)
     watermark_yellow: float = 0.75  # begin proactive offload
     watermark_red: float = 0.90  # aggressive offload + pause prefills
@@ -386,6 +388,7 @@ class MemorySettings:
         """Convert to dictionary."""
         return {
             "max_process_memory": self.max_process_memory,
+            "pressure_management_enabled": self.pressure_management_enabled,
             "watermark_yellow": self.watermark_yellow,
             "watermark_red": self.watermark_red,
             "watermark_critical": self.watermark_critical,
@@ -398,6 +401,9 @@ class MemorySettings:
         """Create from dictionary."""
         instance = cls(
             max_process_memory=data.get("max_process_memory", "auto"),
+            pressure_management_enabled=data.get(
+                "pressure_management_enabled", True
+            ),
             watermark_yellow=data.get("watermark_yellow", 0.75),
             watermark_red=data.get("watermark_red", 0.90),
             watermark_critical=data.get("watermark_critical", 0.95),

@@ -111,6 +111,12 @@ class GlobalSettingsRequest(BaseModel):
     # Memory enforcement
     max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
 
+    # Memory pressure management
+    pressure_management_enabled: Optional[bool] = None
+    target_free_memory: Optional[str] = None  # "disabled", "auto", or "XGB"
+    watermark_yellow: Optional[float] = None
+    watermark_red: Optional[float] = None
+
     # Scheduler settings
     max_num_seqs: Optional[int] = None
     completion_batch_size: Optional[int] = None
@@ -448,10 +454,19 @@ async def _apply_max_process_memory_runtime(
         if _server_state.engine_pool is None:
             return False, "Engine pool not initialized"
         from ..process_memory_enforcer import ProcessMemoryEnforcer
+        from ..settings import get_settings
 
+        global_settings = get_settings()
         enforcer = ProcessMemoryEnforcer(
             engine_pool=_server_state.engine_pool,
             max_bytes=max_bytes,
+            settings_manager=_server_state.settings_manager,
+            pressure_management_enabled=global_settings.memory.pressure_management_enabled,
+            watermark_yellow=global_settings.memory.watermark_yellow,
+            watermark_red=global_settings.memory.watermark_red,
+            watermark_critical=global_settings.memory.watermark_critical,
+            target_free_bytes=global_settings.memory.get_target_free_memory_bytes(),
+            max_evict_blocks_per_cycle=global_settings.memory.max_evict_blocks_per_cycle,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -460,6 +475,28 @@ async def _apply_max_process_memory_runtime(
             f"Process memory enforcement enabled at "
             f"{max_bytes / 1024**3:.1f}GB"
         )
+
+
+def _apply_pressure_settings_runtime(memory_settings) -> None:
+    """Apply pressure management settings to running enforcer."""
+    from ..server import _server_state
+
+    enforcer = _server_state.process_memory_enforcer
+    if enforcer is None:
+        return
+
+    enforcer._pressure_management_enabled = memory_settings.pressure_management_enabled
+    enforcer._watermark_yellow = memory_settings.watermark_yellow
+    enforcer._watermark_red = memory_settings.watermark_red
+    target_free = memory_settings.get_target_free_memory_bytes()
+    enforcer._target_free_bytes = target_free
+    logger.info(
+        f"Pressure management settings updated: "
+        f"enabled={memory_settings.pressure_management_enabled}, "
+        f"yellow={memory_settings.watermark_yellow}, "
+        f"red={memory_settings.watermark_red}, "
+        f"target_free={memory_settings.target_free_memory}"
+    )
 
 
 async def _apply_cache_settings_runtime(
@@ -1612,6 +1649,10 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "memory": {
             "max_process_memory": global_settings.memory.max_process_memory,
+            "pressure_management_enabled": global_settings.memory.pressure_management_enabled,
+            "target_free_memory": global_settings.memory.target_free_memory,
+            "watermark_yellow": global_settings.memory.watermark_yellow,
+            "watermark_red": global_settings.memory.watermark_red,
         },
         "scheduler": {
             "max_num_seqs": global_settings.scheduler.max_num_seqs,
@@ -1782,6 +1823,29 @@ async def update_global_settings(
                 logger.warning(f"Failed to apply max_process_memory: {msg}")
         except Exception as e:
             logger.warning(f"Error applying max_process_memory: {e}")
+
+    # Apply memory pressure management settings
+    pressure_settings_changed = False
+    if request.pressure_management_enabled is not None:
+        global_settings.memory.pressure_management_enabled = request.pressure_management_enabled
+        pressure_settings_changed = True
+    if request.target_free_memory is not None:
+        global_settings.memory.target_free_memory = request.target_free_memory
+        pressure_settings_changed = True
+    if request.watermark_yellow is not None:
+        global_settings.memory.watermark_yellow = request.watermark_yellow
+        pressure_settings_changed = True
+    if request.watermark_red is not None:
+        global_settings.memory.watermark_red = request.watermark_red
+        pressure_settings_changed = True
+
+    if pressure_settings_changed:
+        try:
+            global_settings.memory.validate()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        _apply_pressure_settings_runtime(global_settings.memory)
+        runtime_applied.append("pressure_management")
 
     # Apply scheduler settings (restart required)
     if request.max_num_seqs is not None:

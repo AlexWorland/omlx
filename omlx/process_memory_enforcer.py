@@ -61,6 +61,7 @@ class ProcessMemoryEnforcer:
         max_bytes: int,
         poll_interval: float = 1.0,
         settings_manager: ModelSettingsManager | None = None,
+        pressure_management_enabled: bool = True,
         watermark_yellow: float = 0.75,
         watermark_red: float = 0.90,
         watermark_critical: float = 0.95,
@@ -85,6 +86,7 @@ class ProcessMemoryEnforcer:
         self._max_bytes = max_bytes
         self._poll_interval = poll_interval
         self._settings_manager = settings_manager
+        self._pressure_management_enabled = pressure_management_enabled
         self._watermark_yellow = watermark_yellow
         self._watermark_red = watermark_red
         self._watermark_critical = watermark_critical
@@ -373,6 +375,8 @@ class ProcessMemoryEnforcer:
         - RED: evict blocks (aggressive rate), pause new prefills
         - CRITICAL: ensure paused, defer to existing _check_and_enforce()
         """
+        if not self._pressure_management_enabled:
+            return
         if self._max_bytes <= 0:
             return
 
@@ -557,6 +561,7 @@ class ProcessMemoryEnforcer:
         current = mx.get_active_memory() if self._running else 0
         return {
             "enabled": self._running,
+            "pressure_management_enabled": self._pressure_management_enabled,
             "max_bytes": self._max_bytes,
             "max_formatted": _format_gb(self._max_bytes),
             "current_bytes": current,
