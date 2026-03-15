@@ -114,6 +114,9 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
         self._memory_limit_bytes: int = 0  # soft limit, 0 = disabled
         self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
+        # Evictable-bytes provider for predictive prefill gating.
+        # When set, effective hard limit = hard_limit + evictable_bytes.
+        self._evictable_bytes_fn: Optional[Callable[[], int]] = None
         # Per-UID VLM embeddings for batched prefill.
         # uid → (inputs_embeds, extra_kwargs, start_offset)
         self._vlm_pending: Dict[int, Tuple[mx.array, Dict[str, Any], int]] = {}
@@ -460,15 +463,18 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
+                    effective_hard = self._memory_hard_limit_bytes
+                    if self._evictable_bytes_fn is not None:
+                        effective_hard += self._evictable_bytes_fn()
                     if (
                         self._memory_hard_limit_bytes > 0
-                        and active > self._memory_hard_limit_bytes
+                        and active > effective_hard
                     ):
                         logger.warning(
                             f"Prefill force-stopped at {processed_tokens} "
                             f"tokens: memory {active / 1024**3:.1f}GB "
-                            f"exceeds hard limit "
-                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
+                            f"exceeds effective hard limit "
+                            f"{effective_hard / 1024**3:.1f}GB"
                         )
                         raise RuntimeError(
                             "Memory limit exceeded during prefill"
@@ -479,8 +485,8 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                             f"{processed_tokens} tokens: "
                             f"{active / 1024**3:.1f}GB > "
                             f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                            f"(hard limit: "
-                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
+                            f"(effective hard limit: "
+                            f"{effective_hard / 1024**3:.1f}GB)"
                         )
 
                 # Check for pending aborts between prefill chunks.
@@ -575,15 +581,18 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
+                    effective_hard = self._memory_hard_limit_bytes
+                    if self._evictable_bytes_fn is not None:
+                        effective_hard += self._evictable_bytes_fn()
                     if (
                         self._memory_hard_limit_bytes > 0
-                        and active > self._memory_hard_limit_bytes
+                        and active > effective_hard
                     ):
                         logger.warning(
                             f"Prefill force-stopped at {processed_tokens} "
                             f"tokens: memory {active / 1024**3:.1f}GB "
-                            f"exceeds hard limit "
-                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
+                            f"exceeds effective hard limit "
+                            f"{effective_hard / 1024**3:.1f}GB"
                         )
                         raise RuntimeError(
                             "Memory limit exceeded during prefill"
@@ -594,8 +603,8 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                             f"{processed_tokens} tokens: "
                             f"{active / 1024**3:.1f}GB > "
                             f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                            f"(hard limit: "
-                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
+                            f"(effective hard limit: "
+                            f"{effective_hard / 1024**3:.1f}GB)"
                         )
 
                 # Check for pending aborts between prefill chunks.
@@ -1031,6 +1040,14 @@ class Scheduler:
         self._memory_limit_bytes: int = 0  # soft limit
         self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
 
+        # When True, _schedule_waiting() returns [] so no new prefills start.
+        # Set/cleared by ProcessMemoryEnforcer based on memory pressure zone.
+        self._prefill_paused: bool = False
+
+        # Evictable-bytes provider for predictive prefill gating.
+        # Returns estimated bytes reclaimable via block eviction.
+        self._evictable_bytes_fn: Optional[Callable[[], int]] = None
+
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
@@ -1053,6 +1070,9 @@ class Scheduler:
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self.paged_ssd_cache_manager: Optional["PagedSSDCacheManager"] = None
         self.memory_monitor: Optional["MemoryMonitor"] = None
+
+        # Async SSD block prefetcher (initialized in _init_tiered_cache).
+        self._prefetcher: Optional["SSDBlockPrefetcher"] = None
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
@@ -1546,6 +1566,7 @@ class Scheduler:
         )
         bg._memory_limit_bytes = self._memory_limit_bytes
         bg._memory_hard_limit_bytes = self._memory_hard_limit_bytes
+        bg._evictable_bytes_fn = self._evictable_bytes_fn
         return bg
 
     def _build_sampler_and_processors(
@@ -2295,6 +2316,33 @@ class Scheduler:
                 extra_keys=extra_keys,
             )
             if block_table and block_table.num_tokens > 0:
+                # Try async prefetch if available, otherwise sync reconstruct.
+                if self._prefetcher is not None and self._prefetcher.enabled:
+                    ssd_hashes = self.block_aware_cache.scan_ssd_blocks(
+                        request.prompt_token_ids,
+                        self.config.paged_cache_block_size,
+                    )
+                    if ssd_hashes:
+                        submitted = self._prefetcher.submit_prefetch(
+                            request.request_id, ssd_hashes
+                        )
+                        if submitted:
+                            # Defer reconstruction to _schedule_waiting().
+                            request._prefetch_submitted = True
+                            request.block_table = block_table
+                            request.remaining_tokens = request.prompt_token_ids[
+                                block_table.num_tokens:
+                            ]
+                            # Skip sync reconstruct — add to waiting below.
+                            self.requests[request.request_id] = request
+                            self.waiting.append(request)
+                            logger.debug(
+                                f"Request {request.request_id}: prefetch "
+                                f"submitted for {len(ssd_hashes)} blocks"
+                            )
+                            return
+                    # Prefetch rejected or no SSD blocks — fall through to sync.
+
                 # Reconstruct actual KVCache objects from stored tensor data
                 # Note: reconstruct_cache may modify block_table in-place if
                 # partial reconstruction occurs (some blocks invalid)
@@ -2461,6 +2509,9 @@ class Scheduler:
         Returns:
             True (abort is always enqueued)
         """
+        # Cancel any pending SSD prefetch for this request.
+        if self._prefetcher is not None:
+            self._prefetcher.cancel_prefetch(request_id)
         self._pending_abort_ids.add(request_id)
         logger.debug(f"Enqueued deferred abort for request {request_id}")
         return True
@@ -2617,7 +2668,37 @@ class Scheduler:
         Returns:
             List of requests that were scheduled
         """
+        # Block new prefills when memory pressure is high (RED/CRITICAL zone).
+        # Existing running requests continue generating tokens.
+        if self._prefill_paused:
+            return []
+
         scheduled = []
+
+        # Consume completed prefetches for waiting requests.
+        # This converts async-prefetched SSD bytes into reconstructed cache
+        # before the main scheduling loop picks them up.
+        if self._prefetcher is not None:
+            for request in list(self.waiting):
+                if not getattr(request, '_prefetch_submitted', False):
+                    continue
+                prefetch_data = self._prefetcher.get_prefetched_data(
+                    request.request_id
+                )
+                if prefetch_data is not None:
+                    # Reconstruct from prefetched bytes
+                    self._reconstruct_from_prefetch(request, prefetch_data)
+                    request._prefetch_submitted = False
+                elif not self._prefetcher.has_pending_prefetch(
+                    request.request_id
+                ):
+                    # Prefetch failed/missing — fall back to sync
+                    self._sync_reconstruct_cache(
+                        request, request.block_table
+                    )
+                    request._prefetch_submitted = False
+                    self._prefetcher.record_fallback()
+                # else: still in progress, leave in waiting queue
 
         # Track cache status of first scheduled request to ensure homogeneity
         # None = not determined yet, True = has cache, False = no cache
@@ -3481,6 +3562,9 @@ class Scheduler:
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
         logger.info("Scheduler shutdown initiated...")
+        if self._prefetcher is not None:
+            self._prefetcher.shutdown()
+            self._prefetcher = None
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
@@ -3597,6 +3681,20 @@ class Scheduler:
                         "Failed to initialize boundary snapshot SSD store: %s", e
                     )
 
+            # Initialize SSD block prefetcher for async cache restore.
+            try:
+                from .cache.prefetch import SSDBlockPrefetcher
+
+                self._prefetcher = SSDBlockPrefetcher(
+                    ssd_cache_dir=self.config.paged_ssd_cache_dir
+                )
+                logger.debug("SSD block prefetcher initialized")
+            except Exception as e:
+                logger.debug(f"SSD block prefetcher not available: {e}")
+
+            # Wire evictable-bytes provider for predictive prefill gating.
+            self._setup_evictable_provider()
+
             logger.info(
                 f"paged SSD cache enabled: "
                 f"cache_dir={self.config.paged_ssd_cache_dir}, "
@@ -3666,6 +3764,135 @@ class Scheduler:
             )
 
         return freed
+
+    def _setup_evictable_provider(self) -> None:
+        """Create closure providing evictable byte estimate for prefill gating."""
+        if self.paged_cache_manager is None or self.memory_monitor is None:
+            return
+        pcm = self.paged_cache_manager
+        mm = self.memory_monitor
+        block_size = self.config.paged_cache_block_size
+
+        def _evictable_bytes() -> int:
+            bpb = mm.estimate_block_memory(block_size)
+            return pcm.estimate_evictable_bytes(bpb)
+
+        self._evictable_bytes_fn = _evictable_bytes
+
+    def _sync_reconstruct_cache(
+        self, request: "Request", block_table: Any
+    ) -> None:
+        """Synchronously reconstruct cache from SSD (existing path).
+
+        Extracts the sync reconstruct logic from add_request() so it can be
+        called as a fallback when prefetch fails or is unavailable.
+        """
+        if self.block_aware_cache is None or block_table is None:
+            request.remaining_tokens = request.prompt_token_ids
+            return
+
+        original_tokens = block_table.num_tokens
+        reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
+        if reconstructed:
+            request.prompt_cache = reconstructed
+            request.block_table = block_table
+            request.cached_tokens = block_table.num_tokens
+            request.shared_prefix_blocks = len(block_table.block_ids)
+            request.remaining_tokens = request.prompt_token_ids[
+                block_table.num_tokens:
+            ]
+            # Handle exact prefix hit trimming.
+            if len(request.remaining_tokens) == 0 and request.cached_tokens > 0:
+                if self._cache_list_needs_boundary_snapshot(request.prompt_cache):
+                    if self.paged_cache_manager is not None:
+                        self.paged_cache_manager.delete_block_table(
+                            request.request_id
+                        )
+                    request.prompt_cache = None
+                    request.block_table = None
+                    request.cached_tokens = 0
+                    request.shared_prefix_blocks = 0
+                    request.remaining_tokens = request.prompt_token_ids
+                elif self._trim_prompt_cache_for_generation(request.prompt_cache):
+                    request.cached_tokens = max(0, request.cached_tokens - 1)
+                    request.remaining_tokens = request.prompt_token_ids[-1:]
+                else:
+                    if self.paged_cache_manager is not None:
+                        self.paged_cache_manager.delete_block_table(
+                            request.request_id
+                        )
+                    request.prompt_cache = None
+                    request.block_table = None
+                    request.cached_tokens = 0
+                    request.shared_prefix_blocks = 0
+                    request.remaining_tokens = request.prompt_token_ids
+            if block_table.num_tokens < original_tokens:
+                logger.debug(
+                    f"Request {request.request_id}: sync partial cache hit, "
+                    f"{request.cached_tokens} tokens"
+                )
+        else:
+            # Reconstruction failed — treat as cache miss.
+            if self.paged_cache_manager is not None:
+                self.paged_cache_manager.delete_block_table(request.request_id)
+            request.remaining_tokens = request.prompt_token_ids
+
+    def _reconstruct_from_prefetch(
+        self, request: "Request", prefetch_results: list
+    ) -> None:
+        """Reconstruct cache from pre-loaded SSD bytes (main thread, Metal-safe)."""
+        # Build hash→bytes dict for reconstruct_cache.
+        prefetched_data = {
+            r.block_hash: r.raw_bytes for r in prefetch_results
+        }
+
+        block_table = request.block_table
+        if block_table is None or self.block_aware_cache is None:
+            return
+
+        reconstructed = self.block_aware_cache.reconstruct_cache(
+            block_table,
+            prefetched_block_data=prefetched_data,
+        )
+        if reconstructed:
+            request.prompt_cache = reconstructed
+            request.cached_tokens = block_table.num_tokens
+            request.shared_prefix_blocks = len(block_table.block_ids)
+            request.remaining_tokens = request.prompt_token_ids[
+                block_table.num_tokens:
+            ]
+            # Handle exact prefix hit trimming.
+            if len(request.remaining_tokens) == 0 and request.cached_tokens > 0:
+                if self._cache_list_needs_boundary_snapshot(request.prompt_cache):
+                    if self.paged_cache_manager is not None:
+                        self.paged_cache_manager.delete_block_table(
+                            request.request_id
+                        )
+                    request.prompt_cache = None
+                    request.block_table = None
+                    request.cached_tokens = 0
+                    request.shared_prefix_blocks = 0
+                    request.remaining_tokens = request.prompt_token_ids
+                elif self._trim_prompt_cache_for_generation(request.prompt_cache):
+                    request.cached_tokens = max(0, request.cached_tokens - 1)
+                    request.remaining_tokens = request.prompt_token_ids[-1:]
+                else:
+                    if self.paged_cache_manager is not None:
+                        self.paged_cache_manager.delete_block_table(
+                            request.request_id
+                        )
+                    request.prompt_cache = None
+                    request.block_table = None
+                    request.cached_tokens = 0
+                    request.shared_prefix_blocks = 0
+                    request.remaining_tokens = request.prompt_token_ids
+            if self._prefetcher is not None:
+                self._prefetcher.mark_blocks_used(len(prefetch_results))
+        else:
+            # Reconstruction failed despite having bytes — fall back.
+            self._sync_reconstruct_cache(request, block_table)
+            if self._prefetcher is not None:
+                self._prefetcher.record_fallback()
 
     def _evict_blocks_to_cold(self, bytes_to_free: int) -> int:
         """
