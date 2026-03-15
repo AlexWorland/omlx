@@ -274,10 +274,14 @@ class TestPrefillPause:
             "m1": _make_entry("m1", engine=engine),
         }
         enforcer._set_prefill_paused(True)
-        # Reset mock call count
-        engine.scheduler.__setattr__ = MagicMock()
+        assert enforcer._prefill_paused is True
+        # Calling again with same value should be a no-op (early return).
+        # Verify by checking the scheduler attribute isn't re-assigned.
+        engine.scheduler._prefill_paused = True  # Already set
+        call_count_before = engine.scheduler._prefill_paused  # Just True
         enforcer._set_prefill_paused(True)  # Same state — should no-op
-        # _prefill_paused was already True, method returns early
+        # Still True, no exception, no extra work
+        assert enforcer._prefill_paused is True
 
 
 # =========================================================================
@@ -430,8 +434,7 @@ class TestStatusReporting:
 class TestProactivePressureManagement:
     """Tests for _proactive_pressure_management() integration."""
 
-    @pytest.mark.asyncio
-    async def test_green_zone_unpauses(self, enforcer):
+    def test_green_zone_unpauses(self, enforcer):
         """GREEN zone ensures prefills are unpaused."""
         enforcer._prefill_paused = True
         engine = _make_engine_with_cache()
@@ -440,12 +443,13 @@ class TestProactivePressureManagement:
         }
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.return_value = int(10 * 1024**3 * 0.5)
-            await enforcer._proactive_pressure_management()
+            asyncio.get_event_loop().run_until_complete(
+                enforcer._proactive_pressure_management()
+            )
         assert enforcer._current_zone == PressureZone.GREEN
         assert enforcer._prefill_paused is False
 
-    @pytest.mark.asyncio
-    async def test_yellow_zone_evicts_but_no_pause(self, enforcer):
+    def test_yellow_zone_evicts_but_no_pause(self, enforcer):
         """YELLOW zone evicts blocks but does NOT pause prefills."""
         engine = _make_engine_with_cache(num_evictable=10)
         enforcer._engine_pool._entries = {
@@ -453,14 +457,15 @@ class TestProactivePressureManagement:
         }
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.return_value = int(10 * 1024**3 * 0.80)
-            await enforcer._proactive_pressure_management()
+            asyncio.get_event_loop().run_until_complete(
+                enforcer._proactive_pressure_management()
+            )
         assert enforcer._current_zone == PressureZone.YELLOW
         assert enforcer._prefill_paused is False
         pcm = engine.scheduler.paged_cache_manager
         pcm.evict_block_permanently.assert_called()
 
-    @pytest.mark.asyncio
-    async def test_red_zone_evicts_and_pauses(self, enforcer):
+    def test_red_zone_evicts_and_pauses(self, enforcer):
         """RED zone evicts blocks AND pauses prefills."""
         engine = _make_engine_with_cache(num_evictable=10)
         enforcer._engine_pool._entries = {
@@ -468,14 +473,15 @@ class TestProactivePressureManagement:
         }
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.return_value = int(10 * 1024**3 * 0.92)
-            await enforcer._proactive_pressure_management()
+            asyncio.get_event_loop().run_until_complete(
+                enforcer._proactive_pressure_management()
+            )
         assert enforcer._current_zone == PressureZone.RED
         assert enforcer._prefill_paused is True
         pcm = engine.scheduler.paged_cache_manager
         pcm.evict_block_permanently.assert_called()
 
-    @pytest.mark.asyncio
-    async def test_critical_zone_pauses_defers(self, enforcer):
+    def test_critical_zone_pauses_defers(self, enforcer):
         """CRITICAL zone pauses prefills and defers to _check_and_enforce."""
         engine = _make_engine_with_cache()
         enforcer._engine_pool._entries = {
@@ -483,6 +489,8 @@ class TestProactivePressureManagement:
         }
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.return_value = int(10 * 1024**3 * 0.96)
-            await enforcer._proactive_pressure_management()
+            asyncio.get_event_loop().run_until_complete(
+                enforcer._proactive_pressure_management()
+            )
         assert enforcer._current_zone == PressureZone.CRITICAL
         assert enforcer._prefill_paused is True

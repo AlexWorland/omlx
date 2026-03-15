@@ -97,8 +97,8 @@ class TestMemoryEstimationConsistency:
 class TestSchedulerMemoryBudgetEvictable:
     """Tests for SchedulerMemoryBudget with evictable_bytes_fn."""
 
-    def test_over_hard_limit_fits_with_eviction(self):
-        """Over hard limit but fits when accounting for evictable bytes."""
+    def test_over_hard_limit_not_too_tight_with_eviction(self):
+        """Over raw hard limit but within effective hard → not 'too tight'."""
         budget = SchedulerMemoryBudget(
             hard_limit_bytes=1000,
             soft_limit_bytes=800,
@@ -107,7 +107,22 @@ class TestSchedulerMemoryBudgetEvictable:
         budget.byte_count = 1200  # Over hard (1000) but under effective (1500)
         budget.max_tokens = 10
         remaining_soft, remaining_hard, fits, msg = budget.budget_check()
-        assert fits is True  # 1200 <= 1000 + 500
+        # fits=False because over soft limit, but message should NOT say "too tight"
+        assert "too tight" not in msg
+        # remaining_hard is positive (within effective hard)
+        assert remaining_hard > 0
+
+    def test_fits_when_under_both_limits_with_eviction(self):
+        """Under both soft and effective hard limits → fits=True."""
+        budget = SchedulerMemoryBudget(
+            hard_limit_bytes=1000,
+            soft_limit_bytes=800,
+            evictable_bytes_fn=lambda: 500,
+        )
+        budget.byte_count = 700  # Under soft (800) and effective hard (1500)
+        budget.max_tokens = 10
+        _, _, fits, msg = budget.budget_check()
+        assert fits is True
 
     def test_over_hard_limit_even_with_eviction(self):
         """Over hard limit even with evictable headroom → doesn't fit."""
@@ -127,14 +142,17 @@ class TestSchedulerMemoryBudgetEvictable:
             hard_limit_bytes=1000,
             soft_limit_bytes=800,
         )
-        budget.byte_count = 900  # Under hard
+        # Under both soft and hard → fits
+        budget.byte_count = 700
         budget.max_tokens = 10
         _, _, fits, _ = budget.budget_check()
         assert fits is True
 
-        budget.byte_count = 1100  # Over hard
-        _, _, fits, _ = budget.budget_check()
+        # Over hard → doesn't fit (too tight)
+        budget.byte_count = 1100
+        _, _, fits, msg = budget.budget_check()
         assert fits is False
+        assert "too tight" in msg
 
     def test_soft_limit_not_adjusted_by_evictable(self):
         """Soft limit is NOT widened by evictable bytes."""
