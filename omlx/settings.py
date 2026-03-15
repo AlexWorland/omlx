@@ -299,6 +299,58 @@ class MemorySettings:
 
     max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
 
+    # Watermark thresholds (fraction of max_process_memory)
+    watermark_yellow: float = 0.75  # begin proactive offload
+    watermark_red: float = 0.90  # aggressive offload + pause prefills
+    watermark_critical: float = 0.95  # existing nuclear behavior (abort + unload)
+
+    # Target free memory floor
+    target_free_memory: str = "disabled"  # "disabled", "auto" (4GB), or "XGB"
+
+    # Adaptive offload rate
+    max_evict_blocks_per_cycle: int = 0  # 0 = auto (10% of evictable blocks)
+
+    def __post_init__(self) -> None:
+        """Validate settings after construction."""
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate watermark thresholds are ordered and in range."""
+        for name, val in [
+            ("watermark_yellow", self.watermark_yellow),
+            ("watermark_red", self.watermark_red),
+            ("watermark_critical", self.watermark_critical),
+        ]:
+            if not (0.0 < val < 1.0):
+                raise ValueError(
+                    f"{name} must be in (0.0, 1.0), got {val}"
+                )
+        if not (
+            self.watermark_yellow < self.watermark_red < self.watermark_critical
+        ):
+            raise ValueError(
+                f"Watermarks must be ordered: yellow ({self.watermark_yellow}) "
+                f"< red ({self.watermark_red}) < critical ({self.watermark_critical})"
+            )
+
+    def get_target_free_memory_bytes(self) -> int | None:
+        """
+        Parse target_free_memory setting.
+
+        - "disabled": None (feature off)
+        - "auto": 4GB
+        - "XGB": parse as absolute size
+
+        Returns:
+            Target free memory in bytes, or None if disabled.
+        """
+        value = self.target_free_memory.strip().lower()
+        if value == "disabled":
+            return None
+        if value == "auto":
+            return 4 * 1024**3  # 4GB
+        return parse_size(self.target_free_memory)
+
     def get_max_process_memory_bytes(self) -> int | None:
         """
         Get max process memory in bytes, or None if disabled.
@@ -332,14 +384,30 @@ class MemorySettings:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"max_process_memory": self.max_process_memory}
+        return {
+            "max_process_memory": self.max_process_memory,
+            "watermark_yellow": self.watermark_yellow,
+            "watermark_red": self.watermark_red,
+            "watermark_critical": self.watermark_critical,
+            "target_free_memory": self.target_free_memory,
+            "max_evict_blocks_per_cycle": self.max_evict_blocks_per_cycle,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MemorySettings:
         """Create from dictionary."""
-        return cls(
+        instance = cls(
             max_process_memory=data.get("max_process_memory", "auto"),
+            watermark_yellow=data.get("watermark_yellow", 0.75),
+            watermark_red=data.get("watermark_red", 0.90),
+            watermark_critical=data.get("watermark_critical", 0.95),
+            target_free_memory=data.get("target_free_memory", "disabled"),
+            max_evict_blocks_per_cycle=data.get(
+                "max_evict_blocks_per_cycle", 0
+            ),
         )
+        instance.validate()
+        return instance
 
 
 @dataclass
