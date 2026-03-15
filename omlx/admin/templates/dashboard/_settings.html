@@ -469,6 +469,96 @@
                                         </span>
                                     </div>
                                 </div>
+                                <!-- Proactive Pressure Management -->
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.pressure_management') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            {{ t('settings.resource.pressure_management_description') }}
+                                            <br>
+                                            {{ t('settings.resource.pressure_management_disabled_note') }}
+                                        </p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <label class="relative inline-flex items-center cursor-pointer">
+                                            <input type="checkbox" x-model="globalSettings.memory.pressure_management_enabled"
+                                                   class="sr-only peer">
+                                            <div class="w-9 h-5 bg-neutral-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-neutral-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-neutral-900"></div>
+                                        </label>
+                                        <span class="text-xs w-14 text-right" :class="globalSettings.memory.pressure_management_enabled ? 'text-neutral-600' : 'text-neutral-400'"
+                                              x-text="globalSettings.memory.pressure_management_enabled ? window.t('settings.resource.enabled') : window.t('settings.resource.disabled')"></span>
+                                    </div>
+                                </div>
+                                <!-- Target Free Memory -->
+                                <div class="flex items-center justify-between px-6 py-4 transition-all duration-200"
+                                     :class="globalSettings.memory.pressure_management_enabled ? '' : 'opacity-40 pointer-events-none'"
+                                     x-show="globalSettings.memory.pressure_management_enabled"
+                                     x-transition>
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.target_free_memory') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            {{ t('settings.resource.target_free_memory_description') }}
+                                        </p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
+                                            <input type="checkbox"
+                                                   :checked="globalSettings.memory.target_free_memory === 'auto'"
+                                                   @change="globalSettings.memory.target_free_memory = $event.target.checked ? 'auto' : 'disabled'"
+                                                   class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                            <span class="text-xs text-neutral-500">{{ t('settings.resource.auto') }}</span>
+                                        </label>
+                                        <span class="text-sm text-neutral-600"
+                                              x-text="globalSettings.memory.target_free_memory === 'disabled'
+                                                  ? window.t('settings.resource.target_free_disabled')
+                                                  : globalSettings.memory.target_free_memory === 'auto'
+                                                      ? window.t('settings.resource.auto') + window.t('settings.resource.target_free_auto_desc')
+                                                      : globalSettings.memory.target_free_memory">
+                                        </span>
+                                    </div>
+                                </div>
+                                <!-- Eviction Start Threshold -->
+                                <div class="flex items-center justify-between px-6 py-4 transition-all duration-200"
+                                     :class="globalSettings.memory.pressure_management_enabled ? '' : 'opacity-40 pointer-events-none'"
+                                     x-show="globalSettings.memory.pressure_management_enabled"
+                                     x-transition>
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.eviction_start') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.eviction_start_description') }}</p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range" min="50" max="95" step="5"
+                                               :value="Math.round(globalSettings.memory.watermark_yellow * 100)"
+                                               @input="globalSettings.memory.watermark_yellow = parseInt($event.target.value) / 100; if(globalSettings.memory.watermark_yellow >= globalSettings.memory.watermark_red) { globalSettings.memory.watermark_red = Math.min(0.99, globalSettings.memory.watermark_yellow + 0.05) }"
+                                               class="w-32 h-1.5 rounded-full appearance-none bg-neutral-200 cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
+                                                      [&::-webkit-slider-thumb]:shadow-sm">
+                                        <span class="text-sm w-10 text-right text-neutral-600"
+                                              x-text="Math.round(globalSettings.memory.watermark_yellow * 100) + '%'"></span>
+                                    </div>
+                                </div>
+                                <!-- Aggressive Eviction Threshold -->
+                                <div class="flex items-center justify-between px-6 py-4 transition-all duration-200"
+                                     :class="globalSettings.memory.pressure_management_enabled ? '' : 'opacity-40 pointer-events-none'"
+                                     x-show="globalSettings.memory.pressure_management_enabled"
+                                     x-transition>
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.aggressive_eviction') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.aggressive_eviction_description') }}</p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range" min="50" max="99" step="5"
+                                               :value="Math.round(globalSettings.memory.watermark_red * 100)"
+                                               @input="globalSettings.memory.watermark_red = parseInt($event.target.value) / 100; if(globalSettings.memory.watermark_red <= globalSettings.memory.watermark_yellow) { globalSettings.memory.watermark_yellow = Math.max(0.05, globalSettings.memory.watermark_red - 0.05) }"
+                                               class="w-32 h-1.5 rounded-full appearance-none bg-neutral-200 cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
+                                                      [&::-webkit-slider-thumb]:shadow-sm">
+                                        <span class="text-sm w-10 text-right text-neutral-600"
+                                              x-text="Math.round(globalSettings.memory.watermark_red * 100) + '%'"></span>
+                                    </div>
+                                </div>
                             </div>
                         </div>
 
