@@ -1096,6 +1096,7 @@ class BlockAwarePrefixCache(CacheManager):
     def reconstruct_cache(
         self,
         block_table: BlockTable,
+        prefetched_block_data: Optional[Dict[bytes, bytes]] = None,
     ) -> Optional[List[Any]]:
         """
         Reconstruct cache objects from paged SSD-stored block data.
@@ -1115,6 +1116,10 @@ class BlockAwarePrefixCache(CacheManager):
         Args:
             block_table: BlockTable containing block IDs to reconstruct from.
                         Will be modified in-place if partial reconstruction.
+            prefetched_block_data: Optional pre-loaded raw bytes keyed by block_hash.
+                        When provided and a block hash is present in this dict,
+                        the raw bytes are used instead of reading from SSD.
+                        Existing behavior is completely unchanged when None.
 
         Returns:
             List of reconstructed cache objects (one per layer),
@@ -1160,10 +1165,20 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     break  # Stop here, use valid prefix
 
-                # Load with metadata for type information
-                block_data, block_metadata = self.paged_ssd_cache.load_block_with_metadata(
-                    block.block_hash
-                )
+                # Load with metadata for type information.
+                # Use prefetched bytes when available to skip SSD I/O.
+                if (
+                    prefetched_block_data is not None
+                    and block.block_hash in prefetched_block_data
+                ):
+                    block_data, block_metadata = self._load_block_from_bytes(
+                        block.block_hash,
+                        prefetched_block_data[block.block_hash],
+                    )
+                else:
+                    block_data, block_metadata = self.paged_ssd_cache.load_block_with_metadata(
+                        block.block_hash
+                    )
                 if block_data is None:
                     logger.debug(
                         f"Failed to load block {block_id} from tiered cache, "
@@ -1541,6 +1556,139 @@ class BlockAwarePrefixCache(CacheManager):
             import traceback
             logger.debug(traceback.format_exc())
             return None
+
+    def _load_block_from_bytes(
+        self,
+        block_hash: bytes,
+        raw_bytes: bytes,
+    ) -> "Tuple[Optional[List[Any]], Optional[Dict[str, Any]]]":
+        """Load a block from pre-read raw bytes instead of re-reading from SSD.
+
+        Writes bytes to a temporary file and calls mx.load() on the main thread
+        (Metal-safe). This avoids SSD I/O latency since bytes are already in RAM.
+
+        Args:
+            block_hash: Content hash identifying the block.
+            raw_bytes: Raw safetensors file bytes already read from SSD.
+
+        Returns:
+            Same (cache_data, metadata_dict) tuple as load_block_with_metadata().
+        """
+        import json
+        import os
+        import tempfile
+
+        if not HAS_MLX:
+            return self.paged_ssd_cache.load_block_with_metadata(block_hash)
+
+        tmp_path = None
+        try:
+            # Write pre-read bytes to a temp file; mx.load() requires a file path.
+            with tempfile.NamedTemporaryFile(
+                suffix=".safetensors", delete=False
+            ) as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+
+            import mlx.core as mx
+            arrays, file_metadata = mx.load(tmp_path, return_metadata=True)
+
+            # Resolve layer_cache_types from file metadata
+            layer_cache_types = None
+            if file_metadata and "layer_cache_types" in file_metadata:
+                try:
+                    layer_cache_types = json.loads(file_metadata["layer_cache_types"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Get num_layers from block index metadata (needed for reconstruction)
+            block_index_meta = self.paged_ssd_cache._index.get(block_hash)
+            num_layers = block_index_meta.num_layers if block_index_meta is not None else 0
+
+            if num_layers == 0 and file_metadata and "num_layers" in file_metadata:
+                try:
+                    num_layers = int(file_metadata["num_layers"])
+                except (ValueError, TypeError):
+                    pass
+
+            cache_data = self.paged_ssd_cache._reconstruct_cache_data(
+                arrays, file_metadata, num_layers, layer_cache_types
+            )
+            if cache_data is None:
+                return None, None
+
+            # Build metadata dict
+            metadata_dict: Dict[str, Any] = {
+                "num_layers": num_layers,
+                "token_count": block_index_meta.token_count if block_index_meta else 0,
+                "model_name": block_index_meta.model_name if block_index_meta else "",
+                "layer_cache_types": layer_cache_types,
+                "layer_meta_states": block_index_meta.layer_meta_states if block_index_meta else None,
+            }
+            if not metadata_dict["layer_meta_states"] and file_metadata:
+                if "layer_meta_states" in file_metadata:
+                    try:
+                        raw = json.loads(file_metadata["layer_meta_states"])
+                        metadata_dict["layer_meta_states"] = [
+                            tuple(m) if m else () for m in raw
+                        ]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+            return cache_data, metadata_dict
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to load prefetched block {block_hash.hex()[:16]}: {e}; "
+                f"falling back to SSD read"
+            )
+            return self.paged_ssd_cache.load_block_with_metadata(block_hash)
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    def scan_ssd_blocks(self, prompt_token_ids: List[int], block_size: int) -> List[bytes]:
+        """Scan for SSD-cached blocks matching the given prompt prefix.
+
+        Lightweight operation — returns block hashes without loading data.
+        Used by SSDBlockPrefetcher to identify blocks to pre-read.
+
+        Args:
+            prompt_token_ids: Token IDs to scan for cached blocks.
+            block_size: Number of tokens per block.
+
+        Returns:
+            List of block hashes (bytes) that exist on SSD for this prefix.
+        """
+        if self.paged_ssd_cache is None or not prompt_token_ids:
+            return []
+
+        present_hashes: List[bytes] = []
+        parent_hash: bytes = b""
+
+        for start in range(0, len(prompt_token_ids), block_size):
+            end = min(start + block_size, len(prompt_token_ids))
+            block_tokens = prompt_token_ids[start:end]
+            if not block_tokens:
+                break
+
+            block_hash = compute_block_hash(
+                parent_hash,
+                block_tokens,
+                model_name=self.paged_cache.model_name,
+            )
+
+            if self.paged_ssd_cache.has_block(block_hash):
+                present_hashes.append(block_hash)
+                parent_hash = block_hash
+            else:
+                # Stop at first missing block — contiguous prefix only
+                break
+
+        return present_hashes
 
     def _fallback_reconstruct_layer(
         self,

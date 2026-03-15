@@ -145,6 +145,9 @@ class Request:
     # Cache corruption recovery
     cache_corruption_retries: int = 0   # Per-request corruption retry counter
 
+    # SSD prefetch tracking
+    _prefetch_submitted: bool = False
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
