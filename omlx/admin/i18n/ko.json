@@ -242,6 +242,14 @@
   "settings.model.placeholder_primary": "기본 모델 디렉토리",
   "settings.model.placeholder_additional": "추가 모델 디렉토리",
 
+  "settings.gpu.section_label": "GPU 메모리",
+  "settings.gpu.system_badge": "시스템",
+  "settings.gpu.wired_limit": "GPU 유선 메모리 제한",
+  "settings.gpu.wired_limit_description": "Metal이 할당할 수 있는 최대 메모리입니다. 변경하려면 macOS 관리자 인증이 필요합니다.",
+  "settings.gpu.wired_limit_warning": "변경 시 새 제한을 적용하기 위해 모든 모델이 언로드됩니다.",
+  "settings.gpu.apply": "적용",
+  "settings.gpu.applying": "적용 중...",
+
   "settings.resource.section_label": "리소스 관리",
   "settings.resource.live_badge": "실시간",
   "settings.resource.memory_limit_total": "전체 메모리 제한",

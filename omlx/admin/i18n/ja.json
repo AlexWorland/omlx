@@ -242,6 +242,14 @@
   "settings.model.placeholder_primary": "メインモデルディレクトリ",
   "settings.model.placeholder_additional": "追加モデルディレクトリ",
 
+  "settings.gpu.section_label": "GPUメモリ",
+  "settings.gpu.system_badge": "システム",
+  "settings.gpu.wired_limit": "GPU有線メモリ制限",
+  "settings.gpu.wired_limit_description": "Metalが割り当てられる最大メモリ。変更にはmacOS管理者認証が必要です。",
+  "settings.gpu.wired_limit_warning": "変更すると新しい制限を適用するためにすべてのモデルがアンロードされます。",
+  "settings.gpu.apply": "適用",
+  "settings.gpu.applying": "適用中...",
+
   "settings.resource.section_label": "リソース管理",
   "settings.resource.live_badge": "ライブ",
   "settings.resource.memory_limit_total": "メモリ上限（合計）",

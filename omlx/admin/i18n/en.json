@@ -242,6 +242,14 @@
     "settings.model.placeholder_primary": "Primary model directory",
     "settings.model.placeholder_additional": "Additional model directory",
 
+    "settings.gpu.section_label": "GPU Memory",
+    "settings.gpu.system_badge": "System",
+    "settings.gpu.wired_limit": "GPU Wired Limit",
+    "settings.gpu.wired_limit_description": "Maximum memory Metal can allocate. Requires macOS admin authentication to change.",
+    "settings.gpu.wired_limit_warning": "Changing this will unload all models to apply the new limit.",
+    "settings.gpu.apply": "Apply",
+    "settings.gpu.applying": "Applying...",
+
     "settings.resource.section_label": "Resource Management",
     "settings.resource.live_badge": "Live",
     "settings.resource.memory_limit_total": "Memory Limit (Total)",

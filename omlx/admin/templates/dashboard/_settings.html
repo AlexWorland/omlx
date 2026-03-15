@@ -307,6 +307,111 @@
                             </div>
                         </div>
 
+                        <!-- GPU Memory Limit -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden"
+                             x-data="{
+                                 gpuLimitMb: null,
+                                 systemRamMb: null,
+                                 gpuLimitFormatted: '',
+                                 systemRamFormatted: '',
+                                 newLimitGb: null,
+                                 applying: false,
+                                 gpuError: '',
+                                 gpuSuccess: '',
+                                 async loadGpuLimit() {
+                                     try {
+                                         const r = await fetch('/admin/api/gpu-wired-limit');
+                                         if (r.ok) {
+                                             const d = await r.json();
+                                             this.gpuLimitMb = d.wired_limit_mb;
+                                             this.systemRamMb = d.system_ram_mb;
+                                             this.gpuLimitFormatted = d.wired_limit_formatted;
+                                             this.systemRamFormatted = d.system_ram_formatted;
+                                             this.newLimitGb = Math.round(d.wired_limit_mb / 1024);
+                                         }
+                                     } catch(e) { console.error('Failed to load GPU limit:', e); }
+                                 },
+                                 async applyGpuLimit() {
+                                     this.applying = true;
+                                     this.gpuError = '';
+                                     this.gpuSuccess = '';
+                                     try {
+                                         const r = await fetch('/admin/api/gpu-wired-limit', {
+                                             method: 'POST',
+                                             headers: { 'Content-Type': 'application/json' },
+                                             body: JSON.stringify({ limit_mb: this.newLimitGb * 1024 }),
+                                         });
+                                         const d = await r.json();
+                                         if (r.ok) {
+                                             this.gpuSuccess = d.message;
+                                             this.gpuLimitMb = d.wired_limit_mb;
+                                             this.gpuLimitFormatted = d.wired_limit_formatted;
+                                             setTimeout(() => { this.gpuSuccess = ''; }, 5000);
+                                             // Refresh the main stats since models were unloaded
+                                             if (typeof loadStats === 'function') loadStats();
+                                         } else {
+                                             this.gpuError = d.detail || 'Failed to set GPU limit';
+                                             setTimeout(() => { this.gpuError = ''; }, 5000);
+                                         }
+                                     } catch(e) {
+                                         this.gpuError = 'Failed to set GPU limit';
+                                         setTimeout(() => { this.gpuError = ''; }, 5000);
+                                     } finally {
+                                         this.applying = false;
+                                     }
+                                 }
+                             }"
+                             x-init="loadGpuLimit()">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="cpu" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.gpu.section_label') }}</span>
+                                </div>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                    {{ t('settings.gpu.system_badge') }}
+                                </span>
+                            </div>
+                            <div class="px-6 py-4">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.gpu.wired_limit') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            {{ t('settings.gpu.wired_limit_description') }}
+                                            <br>
+                                            {{ t('settings.gpu.wired_limit_warning') }}
+                                        </p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range"
+                                               :min="8" :max="Math.round(systemRamMb / 1024)"
+                                               step="1"
+                                               x-model.number="newLimitGb"
+                                               :disabled="applying"
+                                               class="w-32 h-1.5 rounded-full appearance-none bg-neutral-200 cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
+                                                      [&::-webkit-slider-thumb]:shadow-sm">
+                                        <span class="text-sm w-20 text-right text-neutral-600" x-text="newLimitGb + 'GB / ' + Math.round(systemRamMb / 1024) + 'GB'"></span>
+                                        <button @click="applyGpuLimit()"
+                                                :disabled="applying || newLimitGb === Math.round(gpuLimitMb / 1024)"
+                                                class="px-3 py-1 text-xs font-medium rounded-lg transition-all duration-200"
+                                                :class="applying || newLimitGb === Math.round(gpuLimitMb / 1024)
+                                                    ? 'bg-neutral-100 text-neutral-400 cursor-not-allowed'
+                                                    : 'bg-neutral-900 text-white hover:bg-neutral-800 cursor-pointer'">
+                                            <span x-show="!applying">{{ t('settings.gpu.apply') }}</span>
+                                            <span x-show="applying" class="flex items-center gap-1">
+                                                <svg class="animate-spin h-3 w-3" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+                                                {{ t('settings.gpu.applying') }}
+                                            </span>
+                                        </button>
+                                    </div>
+                                </div>
+                                <!-- Status messages -->
+                                <div x-show="gpuSuccess" x-transition class="mt-3 text-xs text-green-600 bg-green-50 border border-green-200 rounded-lg px-3 py-2" x-text="gpuSuccess"></div>
+                                <div x-show="gpuError" x-transition class="mt-3 text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2" x-text="gpuError"></div>
+                            </div>
+                        </div>
+
                         <!-- Memory Management Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">

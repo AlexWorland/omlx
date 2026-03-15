@@ -3110,6 +3110,118 @@ async def get_benchmark_results(
     }
 
 
+# =============================================================================
+# GPU Wired Limit
+# =============================================================================
+
+
+@router.get("/api/gpu-wired-limit")
+async def get_gpu_wired_limit_info(is_admin: bool = Depends(require_admin)):
+    """Get current GPU wired memory limit and system RAM."""
+    from ..settings import get_gpu_wired_limit, get_system_memory
+
+    gpu_limit = get_gpu_wired_limit()
+    system_ram = get_system_memory()
+
+    return {
+        "wired_limit_mb": gpu_limit // (1024**2) if gpu_limit else None,
+        "wired_limit_bytes": gpu_limit,
+        "system_ram_mb": system_ram // (1024**2),
+        "system_ram_bytes": system_ram,
+        "wired_limit_formatted": f"{gpu_limit / 1024**3:.1f}GB" if gpu_limit else "unknown",
+        "system_ram_formatted": f"{system_ram / 1024**3:.1f}GB",
+    }
+
+
+@router.post("/api/gpu-wired-limit")
+async def set_gpu_wired_limit(
+    request: dict,
+    is_admin: bool = Depends(require_admin),
+):
+    """Set GPU wired memory limit. Requires macOS admin authentication.
+
+    Unloads all models to free Metal allocations for the new limit.
+    """
+    import gc
+    import subprocess
+
+    import mlx.core as mx
+
+    from ..server import _server_state
+    from ..settings import get_gpu_wired_limit, get_system_memory, get_settings
+
+    limit_mb = request.get("limit_mb")
+    if not limit_mb or not isinstance(limit_mb, int):
+        raise HTTPException(status_code=400, detail="limit_mb must be a positive integer")
+
+    system_ram_mb = get_system_memory() // (1024**2)
+    if not (1024 <= limit_mb <= system_ram_mb):
+        raise HTTPException(
+            status_code=400,
+            detail=f"limit_mb must be between 1024 and {system_ram_mb}",
+        )
+
+    # Set via osascript with admin privileges (shows macOS password dialog)
+    try:
+        result = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'do shell script "sysctl -w iogpu.wired_limit_mb={limit_mb}" with administrator privileges',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,  # User needs time to enter password
+        )
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() or "User cancelled or authentication failed"
+            raise HTTPException(status_code=403, detail=error_msg)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Authentication timed out")
+
+    # Unload all models to free Metal allocations
+    engine_pool = _server_state.engine_pool
+    unloaded_count = 0
+    if engine_pool is not None:
+        async with engine_pool._lock:
+            for model_id in list(engine_pool._entries.keys()):
+                entry = engine_pool._entries.get(model_id)
+                if entry and entry.engine is not None:
+                    # Abort active requests first
+                    if hasattr(entry.engine, "abort_all_requests"):
+                        await entry.engine.abort_all_requests()
+                    await engine_pool._unload_engine(model_id)
+                    unloaded_count += 1
+
+        # Force garbage collection and clear Metal cache
+        gc.collect()
+        loop = asyncio.get_running_loop()
+        from ..engine_core import get_mlx_executor
+
+        await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+
+    # Update enforcer max_bytes
+    if _server_state.process_memory_enforcer is not None:
+        global_settings = get_settings()
+        new_max = global_settings.memory.get_max_process_memory_bytes()
+        if new_max is not None:
+            _server_state.process_memory_enforcer.max_bytes = new_max
+
+    new_limit = get_gpu_wired_limit()
+    logger.info(
+        f"GPU wired limit changed to {limit_mb}MB, "
+        f"unloaded {unloaded_count} model(s)"
+    )
+
+    return {
+        "success": True,
+        "message": f"GPU wired limit set to {limit_mb}MB. {unloaded_count} model(s) unloaded.",
+        "wired_limit_mb": new_limit // (1024**2) if new_limit else limit_mb,
+        "wired_limit_formatted": f"{limit_mb / 1024:.1f}GB",
+        "models_unloaded": unloaded_count,
+    }
+
+
 @router.get("/api/device-info")
 async def get_device_info(
     is_admin: bool = Depends(require_admin),
