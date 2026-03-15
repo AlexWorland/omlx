@@ -465,7 +465,14 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     active = mx.get_active_memory()
                     effective_hard = self._memory_hard_limit_bytes
                     if self._evictable_bytes_fn is not None:
-                        effective_hard += self._evictable_bytes_fn()
+                        evictable = self._evictable_bytes_fn()
+                        effective_hard += evictable
+                        if evictable > 0 and active > self._memory_hard_limit_bytes and active <= effective_hard:
+                            logger.debug(
+                                f"Prefill continuing with evictable headroom: "
+                                f"active={active / 1024**3:.1f}GB, hard={self._memory_hard_limit_bytes / 1024**3:.1f}GB, "
+                                f"evictable={evictable / 1024**3:.1f}GB, effective={effective_hard / 1024**3:.1f}GB"
+                            )
                     if (
                         self._memory_hard_limit_bytes > 0
                         and active > effective_hard
@@ -583,7 +590,14 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     active = mx.get_active_memory()
                     effective_hard = self._memory_hard_limit_bytes
                     if self._evictable_bytes_fn is not None:
-                        effective_hard += self._evictable_bytes_fn()
+                        evictable = self._evictable_bytes_fn()
+                        effective_hard += evictable
+                        if evictable > 0 and active > self._memory_hard_limit_bytes and active <= effective_hard:
+                            logger.debug(
+                                f"Prefill continuing with evictable headroom: "
+                                f"active={active / 1024**3:.1f}GB, hard={self._memory_hard_limit_bytes / 1024**3:.1f}GB, "
+                                f"evictable={evictable / 1024**3:.1f}GB, effective={effective_hard / 1024**3:.1f}GB"
+                            )
                     if (
                         self._memory_hard_limit_bytes > 0
                         and active > effective_hard
@@ -2341,7 +2355,11 @@ class Scheduler:
                                 f"submitted for {len(ssd_hashes)} blocks"
                             )
                             return
-                    # Prefetch rejected or no SSD blocks — fall through to sync.
+                        else:
+                            logger.debug(f"Request {request.request_id}: prefetch rejected (at capacity), using sync")
+                    else:
+                        logger.debug(f"Request {request.request_id}: no SSD blocks for prefetch, using sync")
+                    # Fall through to sync reconstruct.
 
                 # Reconstruct actual KVCache objects from stored tensor data
                 # Note: reconstruct_cache may modify block_table in-place if
@@ -2671,6 +2689,8 @@ class Scheduler:
         # Block new prefills when memory pressure is high (RED/CRITICAL zone).
         # Existing running requests continue generating tokens.
         if self._prefill_paused:
+            if self.waiting:
+                logger.debug(f"Prefill paused: {len(self.waiting)} request(s) waiting")
             return []
 
         scheduled = []
@@ -2687,12 +2707,14 @@ class Scheduler:
                 )
                 if prefetch_data is not None:
                     # Reconstruct from prefetched bytes
+                    logger.debug(f"Request {request.request_id}: consumed prefetch ({len(prefetch_data)} blocks)")
                     self._reconstruct_from_prefetch(request, prefetch_data)
                     request._prefetch_submitted = False
                 elif not self._prefetcher.has_pending_prefetch(
                     request.request_id
                 ):
                     # Prefetch failed/missing — fall back to sync
+                    logger.debug(f"Request {request.request_id}: prefetch unavailable, falling back to sync reconstruct")
                     self._sync_reconstruct_cache(
                         request, request.block_table
                     )
@@ -3888,8 +3910,13 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids
             if self._prefetcher is not None:
                 self._prefetcher.mark_blocks_used(len(prefetch_results))
+            logger.debug(
+                f"Request {request.request_id}: reconstructed from prefetch, "
+                f"{request.cached_tokens} cached tokens"
+            )
         else:
             # Reconstruction failed despite having bytes — fall back.
+            logger.debug(f"Request {request.request_id}: prefetch reconstruction failed, falling back to sync")
             self._sync_reconstruct_cache(request, block_table)
             if self._prefetcher is not None:
                 self._prefetcher.record_fallback()

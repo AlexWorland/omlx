@@ -152,6 +152,7 @@ class SSDBlockPrefetcher:
             with open(block_path, "rb") as f:
                 raw_bytes = f.read()
             elapsed = time.monotonic() - start
+            logger.debug(f"Prefetch read block {hash_hex[:16]}: {len(raw_bytes)} bytes in {elapsed*1000:.1f}ms")
             return PrefetchResult(
                 block_hash=block_hash,
                 raw_bytes=raw_bytes,
@@ -202,6 +203,8 @@ class SSDBlockPrefetcher:
             del self._active_jobs[request_id]
             self._stats.jobs_completed += 1
 
+            if results:
+                logger.debug(f"Prefetch data ready for {request_id}: {len(results)} blocks")
             return results if results else None
 
     def cancel_prefetch(self, request_id: str) -> None:

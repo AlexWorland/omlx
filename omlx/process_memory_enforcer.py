@@ -220,8 +220,22 @@ class ProcessMemoryEnforcer:
             ]
             wm_idx = zone_order.index(wm_zone)
             tf_idx = zone_order.index(tf_zone)
-            return zone_order[max(wm_idx, tf_idx)]
+            result_zone = zone_order[max(wm_idx, tf_idx)]
+            logger.debug(
+                f"Zone calculation: current={_format_gb(current_bytes)}, "
+                f"max={_format_gb(self._max_bytes)}, utilization={utilization:.1%}, "
+                f"wm_zone={wm_zone.value}, tf_zone={tf_zone.value}, "
+                f"result={result_zone.value}"
+            )
+            return result_zone
 
+        if wm_zone != PressureZone.GREEN:
+            logger.debug(
+                f"Zone calculation: current={_format_gb(current_bytes)}, "
+                f"max={_format_gb(self._max_bytes)}, utilization={utilization:.1%}, "
+                f"wm_zone={wm_zone.value}, tf_zone=n/a, "
+                f"result={wm_zone.value}"
+            )
         return wm_zone
 
     # =========================================================================
@@ -263,7 +277,12 @@ class ProcessMemoryEnforcer:
         urgency = (utilization - self._watermark_yellow) / span
         urgency = max(0.0, min(1.0, urgency))
 
-        return max(1, int(urgency * max_per_cycle))
+        result = max(1, int(urgency * max_per_cycle))
+        logger.debug(
+            f"Eviction rate: urgency={urgency:.2f}, max_per_cycle={max_per_cycle}, "
+            f"blocks_to_evict={result}, total_evictable={total_evictable_blocks}"
+        )
+        return result
 
     # =========================================================================
     # KV cache block eviction across engines
@@ -307,12 +326,19 @@ class ProcessMemoryEnforcer:
                 continue
 
             blocks = pcm.get_evictable_blocks(remaining)
+            evicted_from_engine = 0
             for block in blocks:
                 if pcm.evict_block_permanently(block.block_id):
                     total_evicted += 1
+                    evicted_from_engine += 1
                     remaining -= 1
                     if remaining <= 0:
                         break
+            if evicted_from_engine > 0:
+                logger.debug(
+                    f"Evicted {evicted_from_engine} blocks from engine '{entry.model_id}' "
+                    f"(requested {evicted_from_engine + remaining})"
+                )
 
         if total_evicted > 0:
             logger.info(
@@ -384,7 +410,8 @@ class ProcessMemoryEnforcer:
         new_zone = self._calculate_zone(current)
 
         # Log zone transitions
-        if new_zone != self._current_zone:
+        zone_changed = new_zone != self._current_zone
+        if zone_changed:
             logger.info(
                 f"Pressure zone: {self._current_zone.value} -> "
                 f"{new_zone.value} "
@@ -395,6 +422,8 @@ class ProcessMemoryEnforcer:
 
         if self._current_zone == PressureZone.GREEN:
             self._set_prefill_paused(False)
+            if zone_changed:
+                logger.debug("GREEN: no action needed")
             return
 
         if self._current_zone == PressureZone.YELLOW:
@@ -403,7 +432,8 @@ class ProcessMemoryEnforcer:
             blocks_to_evict = self._calculate_blocks_to_evict(
                 total_evictable
             )
-            self._evict_blocks_across_engines(blocks_to_evict)
+            evicted = self._evict_blocks_across_engines(blocks_to_evict)
+            logger.debug(f"YELLOW action: evicted {evicted} blocks, prefill_paused=False")
             return
 
         if self._current_zone == PressureZone.RED:
@@ -412,11 +442,13 @@ class ProcessMemoryEnforcer:
             blocks_to_evict = self._calculate_blocks_to_evict(
                 total_evictable
             )
-            self._evict_blocks_across_engines(blocks_to_evict)
+            evicted = self._evict_blocks_across_engines(blocks_to_evict)
+            logger.debug(f"RED action: evicted {evicted} blocks, prefill_paused=True")
             return
 
         # CRITICAL: ensure paused, defer to _check_and_enforce()
         self._set_prefill_paused(True)
+        logger.debug("CRITICAL action: prefill paused, deferring to _check_and_enforce")
 
     # =========================================================================
     # Enforcement loop
