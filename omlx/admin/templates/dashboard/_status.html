@@ -124,52 +124,30 @@
                                       x-text="stats.memory_pressure ? (stats.memory_pressure.utilization * 100).toFixed(1) + '%' : ''"></span>
                             </div>
                             <!-- Segmented progress bar -->
-                            <div class="relative h-4 rounded-full overflow-hidden bg-neutral-100" x-data>
-                                <template x-if="stats.memory_pressure">
-                                    <div class="absolute inset-0">
-                                        <!-- Green zone: 0 to yellow watermark -->
-                                        <div class="absolute top-0 bottom-0 left-0 bg-green-200"
-                                             :style="'width: ' + (stats.memory_pressure.watermarks.yellow * 100) + '%'"></div>
-                                        <!-- Yellow zone: yellow to red watermark -->
-                                        <div class="absolute top-0 bottom-0 bg-amber-200"
-                                             :style="'left: ' + (stats.memory_pressure.watermarks.yellow * 100) + '%; width: ' + ((stats.memory_pressure.watermarks.red - stats.memory_pressure.watermarks.yellow) * 100) + '%'"></div>
-                                        <!-- Red zone: red to critical watermark -->
-                                        <div class="absolute top-0 bottom-0 bg-red-200"
-                                             :style="'left: ' + (stats.memory_pressure.watermarks.red * 100) + '%; width: ' + ((stats.memory_pressure.watermarks.critical - stats.memory_pressure.watermarks.red) * 100) + '%'"></div>
-                                        <!-- Critical zone: critical to 100% -->
-                                        <div class="absolute top-0 bottom-0 right-0 bg-red-300"
-                                             :style="'left: ' + (stats.memory_pressure.watermarks.critical * 100) + '%'"></div>
-                                        <!-- Current utilization fill overlay -->
-                                        <div class="absolute top-0 bottom-0 left-0 transition-all duration-500 opacity-80 rounded-r-full"
-                                             :class="pressureZoneColor(stats.memory_pressure.pressure_zone)"
-                                             :style="'width: ' + Math.min(100, stats.memory_pressure.utilization * 100) + '%'"></div>
-                                        <!-- Watermark tick: yellow -->
-                                        <div class="absolute top-0 bottom-0 w-px bg-amber-500 opacity-70"
-                                             :style="'left: ' + (stats.memory_pressure.watermarks.yellow * 100) + '%'"></div>
-                                        <!-- Watermark tick: red -->
-                                        <div class="absolute top-0 bottom-0 w-px bg-red-500 opacity-70"
-                                             :style="'left: ' + (stats.memory_pressure.watermarks.red * 100) + '%'"></div>
-                                        <!-- Watermark tick: critical -->
-                                        <div class="absolute top-0 bottom-0 w-px bg-red-800 opacity-70"
-                                             :style="'left: ' + (stats.memory_pressure.watermarks.critical * 100) + '%'"></div>
-                                    </div>
-                                </template>
+                            <div x-show="stats.memory_pressure" class="relative h-4 rounded-full overflow-hidden"
+                                 :style="stats.memory_pressure ? 'background:linear-gradient(to right,rgba(34,197,94,0.15) 0%,rgba(34,197,94,0.15) ' + (stats.memory_pressure.watermarks.yellow*100) + '%,rgba(245,158,11,0.15) ' + (stats.memory_pressure.watermarks.yellow*100) + '%,rgba(245,158,11,0.15) ' + (stats.memory_pressure.watermarks.red*100) + '%,rgba(239,68,68,0.15) ' + (stats.memory_pressure.watermarks.red*100) + '%,rgba(239,68,68,0.15) ' + (stats.memory_pressure.watermarks.critical*100) + '%,rgba(185,28,28,0.2) ' + (stats.memory_pressure.watermarks.critical*100) + '%,rgba(185,28,28,0.2) 100%)' : ''">
+                                <!-- Current utilization fill -->
+                                <div style="position:absolute;top:0;bottom:0;left:0;border-radius:0 9999px 9999px 0;transition:width 0.5s"
+                                     :style="stats.memory_pressure ? 'width:' + Math.min(100, stats.memory_pressure.utilization * 100) + '%;background-color:' + pressureZoneColor(stats.memory_pressure.pressure_zone) : ''"></div>
+                                <!-- Watermark ticks -->
+                                <div style="position:absolute;top:0;bottom:0;width:1px;background-color:#f59e0b;opacity:0.5"
+                                     :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.yellow * 100) + '%' : ''"></div>
+                                <div style="position:absolute;top:0;bottom:0;width:1px;background-color:#ef4444;opacity:0.5"
+                                     :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.red * 100) + '%' : ''"></div>
+                                <div style="position:absolute;top:0;bottom:0;width:1px;background-color:#991b1b;opacity:0.5"
+                                     :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.critical * 100) + '%' : ''"></div>
                             </div>
                             <!-- Watermark labels -->
-                            <div class="relative mt-1 h-4" x-data>
-                                <template x-if="stats.memory_pressure">
-                                    <div>
-                                        <span class="absolute text-[10px] text-amber-600 font-medium -translate-x-1/2"
-                                              :style="'left: ' + (stats.memory_pressure.watermarks.yellow * 100) + '%'"
-                                              x-text="(stats.memory_pressure.watermarks.yellow * 100).toFixed(0) + '%'"></span>
-                                        <span class="absolute text-[10px] text-red-600 font-medium -translate-x-1/2"
-                                              :style="'left: ' + (stats.memory_pressure.watermarks.red * 100) + '%'"
-                                              x-text="(stats.memory_pressure.watermarks.red * 100).toFixed(0) + '%'"></span>
-                                        <span class="absolute text-[10px] text-red-800 font-medium -translate-x-1/2"
-                                              :style="'left: ' + (stats.memory_pressure.watermarks.critical * 100) + '%'"
-                                              x-text="(stats.memory_pressure.watermarks.critical * 100).toFixed(0) + '%'"></span>
-                                    </div>
-                                </template>
+                            <div x-show="stats.memory_pressure" class="relative mt-1 h-4">
+                                <span class="absolute text-[10px] text-amber-600 font-medium -translate-x-1/2"
+                                      :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.yellow * 100) + '%' : ''"
+                                      x-text="stats.memory_pressure ? (stats.memory_pressure.watermarks.yellow * 100).toFixed(0) + '%' : ''"></span>
+                                <span class="absolute text-[10px] text-red-600 font-medium -translate-x-1/2"
+                                      :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.red * 100) + '%' : ''"
+                                      x-text="stats.memory_pressure ? (stats.memory_pressure.watermarks.red * 100).toFixed(0) + '%' : ''"></span>
+                                <span class="absolute text-[10px] text-red-700 font-medium -translate-x-1/2"
+                                      :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.critical * 100) + '%' : ''"
+                                      x-text="stats.memory_pressure ? (stats.memory_pressure.watermarks.critical * 100).toFixed(0) + '%' : ''"></span>
                             </div>
                         </div>
                         <!-- Footer indicators -->

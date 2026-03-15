@@ -1133,21 +1133,23 @@
             },
 
             pressureZoneColor(zone) {
+                // Returns CSS color values (not Tailwind classes) for inline style use
                 const map = {
-                    green: 'bg-green-500',
-                    yellow: 'bg-amber-500',
-                    red: 'bg-red-500',
-                    critical: 'bg-red-700',
+                    green: '#22c55e',
+                    yellow: '#f59e0b',
+                    red: '#ef4444',
+                    critical: '#b91c1c',
                 };
-                return map[zone] || 'bg-green-500';
+                return map[zone] || '#22c55e';
             },
 
             pressureZoneBadgeClasses(zone) {
+                // Uses only classes present in compiled tailwind.css
                 const map = {
                     green: 'bg-green-100 text-green-700',
                     yellow: 'bg-amber-100 text-amber-700',
                     red: 'bg-red-100 text-red-700',
-                    critical: 'bg-red-200 text-red-800',
+                    critical: 'bg-red-100 text-red-700',
                 };
                 return map[zone] || 'bg-green-100 text-green-700';
             },
