@@ -334,8 +334,22 @@ class MemorySettings:
     # Target free memory floor
     target_free_memory: str = "disabled"  # "disabled", "auto" (4GB), or "XGB"
 
+    # Hysteresis band to prevent zone flapping (utilization fraction)
+    hysteresis_band: float = 0.02
+
     # Adaptive offload rate
     max_evict_blocks_per_cycle: int = 0  # 0 = auto (10% of evictable blocks)
+
+    # System RAM monitoring (dual-signal pressure)
+    system_memory_monitoring: bool = True
+    system_watermark_yellow: float = 0.80
+    system_watermark_red: float = 0.90
+    system_watermark_critical: float = 0.95
+
+    # JIT loading and model lifecycle
+    global_ttl_seconds: int = 180  # Default TTL for models without per-model TTL. 0 = disabled.
+    model_scan_interval_seconds: int = 60  # Rescan interval. 0 = disabled, minimum 10.
+    jit_loading_behavior: str = "block"  # "block" or "reject" (503)
 
     def __post_init__(self) -> None:
         """Validate settings after construction."""
@@ -358,6 +372,40 @@ class MemorySettings:
             raise ValueError(
                 f"Watermarks must be ordered: yellow ({self.watermark_yellow}) "
                 f"< red ({self.watermark_red}) < critical ({self.watermark_critical})"
+            )
+        # System RAM watermark validation
+        for name, val in [
+            ("system_watermark_yellow", self.system_watermark_yellow),
+            ("system_watermark_red", self.system_watermark_red),
+            ("system_watermark_critical", self.system_watermark_critical),
+        ]:
+            if not (0.0 < val < 1.0):
+                raise ValueError(
+                    f"{name} must be in (0.0, 1.0), got {val}"
+                )
+        if not (
+            self.system_watermark_yellow
+            < self.system_watermark_red
+            < self.system_watermark_critical
+        ):
+            raise ValueError(
+                f"System watermarks must be ordered: yellow ({self.system_watermark_yellow}) "
+                f"< red ({self.system_watermark_red}) < critical ({self.system_watermark_critical})"
+            )
+        # JIT loading settings validation
+        if self.global_ttl_seconds < 0:
+            raise ValueError(
+                f"global_ttl_seconds must be >= 0, got {self.global_ttl_seconds}"
+            )
+        if self.model_scan_interval_seconds != 0 and self.model_scan_interval_seconds < 10:
+            raise ValueError(
+                f"model_scan_interval_seconds must be 0 (disabled) or >= 10, "
+                f"got {self.model_scan_interval_seconds}"
+            )
+        if self.jit_loading_behavior not in ("block", "reject"):
+            raise ValueError(
+                f"jit_loading_behavior must be 'block' or 'reject', "
+                f"got '{self.jit_loading_behavior}'"
             )
 
     def get_target_free_memory_bytes(self) -> int | None:
@@ -445,7 +493,12 @@ class MemorySettings:
             "watermark_red": self.watermark_red,
             "watermark_critical": self.watermark_critical,
             "target_free_memory": self.target_free_memory,
+            "hysteresis_band": self.hysteresis_band,
             "max_evict_blocks_per_cycle": self.max_evict_blocks_per_cycle,
+            "system_memory_monitoring": self.system_memory_monitoring,
+            "system_watermark_yellow": self.system_watermark_yellow,
+            "system_watermark_red": self.system_watermark_red,
+            "system_watermark_critical": self.system_watermark_critical,
         }
 
     @classmethod
@@ -460,9 +513,14 @@ class MemorySettings:
             watermark_red=data.get("watermark_red", 0.90),
             watermark_critical=data.get("watermark_critical", 0.95),
             target_free_memory=data.get("target_free_memory", "disabled"),
+            hysteresis_band=data.get("hysteresis_band", 0.02),
             max_evict_blocks_per_cycle=data.get(
                 "max_evict_blocks_per_cycle", 0
             ),
+            system_memory_monitoring=data.get("system_memory_monitoring", True),
+            system_watermark_yellow=data.get("system_watermark_yellow", 0.80),
+            system_watermark_red=data.get("system_watermark_red", 0.90),
+            system_watermark_critical=data.get("system_watermark_critical", 0.95),
         )
         instance.validate()
         return instance
