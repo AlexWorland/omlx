@@ -123,7 +123,7 @@ def _make_mock_pool():
     pool = MagicMock(spec=EnginePool)
     pool._entries = {}
     pool._lock = asyncio.Lock()
-    pool._unload_engine = AsyncMock()
+    pool._unload_engine_unlocked = AsyncMock()
     pool.check_ttl_expirations = EnginePool.check_ttl_expirations.__get__(pool)
     return pool
 
@@ -214,7 +214,7 @@ class TestTTLEviction:
 
             async def mock_unload(mid):
                 pool._entries[mid].engine = None
-            pool._unload_engine = mock_unload
+            pool._unload_engine_unlocked = mock_unload
 
             settings_mgr = _make_mock_settings_manager()
             expired = await pool.check_ttl_expirations(settings_mgr, global_ttl_seconds=180)
@@ -286,3 +286,122 @@ class TestRescanModels:
 
         assert "model-b" in pool._entries
         assert "model-b" not in removed
+
+
+# =========================================================================
+# JIT Loading (Two-Phase Locking)
+# =========================================================================
+
+from omlx.exceptions import ModelNotFoundError, ModelLoadingError
+
+
+class TestJITLoading:
+    def test_jit_loads_discovered_model(self):
+        """Requesting a discovered model triggers JIT load."""
+        pool = EnginePool(max_model_memory=None, scheduler_config=MagicMock())
+        entry = EngineEntry(
+            model_id="m1",
+            model_path="/tmp/m1",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+        )
+        pool._entries = {"m1": entry}
+        mock_engine = MagicMock()
+
+        async def fake_load(mid):
+            pool._entries[mid].engine = mock_engine
+            pool._entries[mid].last_access = time.time()
+
+        with patch.object(pool, "_load_engine", side_effect=fake_load):
+            engine = asyncio.run(pool.get_engine("m1"))
+            assert engine is mock_engine
+
+    def test_loaded_model_returns_immediately(self):
+        """Already-loaded model returns without calling _load_engine."""
+        pool = EnginePool(max_model_memory=None, scheduler_config=MagicMock())
+        mock_engine = MagicMock()
+        entry = EngineEntry(
+            model_id="m1",
+            model_path="/tmp/m1",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+            engine=mock_engine,
+            last_access=time.time(),
+        )
+        pool._entries = {"m1": entry}
+
+        with patch.object(pool, "_load_engine") as mock_load:
+            engine = asyncio.run(pool.get_engine("m1"))
+            assert engine is mock_engine
+            mock_load.assert_not_called()
+
+    def test_concurrent_requests_share_single_load(self):
+        """Multiple concurrent requests share one load via loading_event."""
+
+        async def _run():
+            pool = EnginePool(max_model_memory=None, scheduler_config=MagicMock())
+            entry = EngineEntry(
+                model_id="m1",
+                model_path="/tmp/m1",
+                model_type="llm",
+                engine_type="batched",
+                estimated_size=1000,
+            )
+            pool._entries = {"m1": entry}
+            load_count = 0
+            mock_engine = MagicMock()
+
+            async def slow_load(mid):
+                nonlocal load_count
+                load_count += 1
+                await asyncio.sleep(0.05)
+                pool._entries[mid].engine = mock_engine
+                pool._entries[mid].last_access = time.time()
+
+            with patch.object(pool, "_load_engine", side_effect=slow_load):
+                results = await asyncio.gather(
+                    pool.get_engine("m1"),
+                    pool.get_engine("m1"),
+                    pool.get_engine("m1"),
+                )
+            assert all(r is mock_engine for r in results)
+            assert load_count == 1
+
+        asyncio.run(_run())
+
+    def test_model_not_found_raises(self):
+        """Requesting a nonexistent model raises ModelNotFoundError."""
+        pool = EnginePool(max_model_memory=None, scheduler_config=MagicMock())
+        pool._entries = {}
+        with pytest.raises(ModelNotFoundError):
+            asyncio.run(pool.get_engine("nonexistent"))
+
+    def test_load_failure_unblocks_waiters(self):
+        """When JIT load fails, concurrent waiters get an error."""
+
+        async def _run():
+            pool = EnginePool(max_model_memory=None, scheduler_config=MagicMock())
+            entry = EngineEntry(
+                model_id="m1",
+                model_path="/tmp/m1",
+                model_type="llm",
+                engine_type="batched",
+                estimated_size=1000,
+            )
+            pool._entries = {"m1": entry}
+
+            async def failing_load(mid):
+                await asyncio.sleep(0.05)
+                raise RuntimeError("corrupt weights")
+
+            with patch.object(pool, "_load_engine", side_effect=failing_load):
+                results = await asyncio.gather(
+                    pool.get_engine("m1"),
+                    pool.get_engine("m1"),
+                    return_exceptions=True,
+                )
+            assert all(isinstance(r, Exception) for r in results)
+
+        asyncio.run(_run())

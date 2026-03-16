@@ -327,14 +327,14 @@ class EnginePool:
 
     async def get_engine(self, model_id: str) -> BaseEngine | EmbeddingEngine | RerankerEngine:
         """
-        Get or load engine for the specified model.
+        Get or load engine for the specified model using two-phase locking.
 
-        This method implements pre-load memory checking:
-        1. Check if model is already loaded → return immediately
-        2. Check if model is too large for memory limit → raise error
-        3. Evict LRU models until there's enough space
-        4. Load the model
-        5. Return the engine
+        Phase 1 (under lock): Check entry state and decide action.
+        Phase 2 (outside lock): Perform the actual model load so concurrent
+        requests for *other* models are not blocked.
+
+        Concurrent requests for the *same* model wait on ``loading_event``
+        and share a single load.
 
         Args:
             model_id: The model ID to get engine for
@@ -346,95 +346,136 @@ class EnginePool:
             ModelNotFoundError: If model is not discovered
             ModelTooLargeError: If model exceeds memory limit
             InsufficientMemoryError: If can't free enough memory (all pinned)
-            ModelLoadingError: If model is already being loaded
+            ModelLoadingError: If model failed to load (for concurrent waiters)
         """
-        async with self._lock:
-            entry = self._entries.get(model_id)
-            if not entry:
-                raise ModelNotFoundError(model_id, list(self._entries.keys()))
+        while True:
+            need_load = False
+            loading_event = None
 
-            # Already loaded - just update access time
-            if entry.engine is not None:
-                entry.last_access = time.time()
-                return entry.engine
+            async with self._lock:
+                entry = self._entries.get(model_id)
+                if not entry:
+                    raise ModelNotFoundError(model_id, list(self._entries.keys()))
 
-            # Check if model is too large for memory limit
-            if (
-                self._max_model_memory is not None
-                and entry.estimated_size > self._max_model_memory
-            ):
-                raise ModelTooLargeError(
-                    model_id, entry.estimated_size, self._max_model_memory
-                )
+                # Case 1: Already loaded — return immediately
+                if entry.engine is not None and not entry.is_loading:
+                    entry.last_access = time.time()
+                    return entry.engine
 
-            # Pre-load eviction: reserve 25% extra for KV cache headroom
-            # so other models get evicted earlier, leaving room for context.
-            # Always try to evict with headroom first. If all evictable models
-            # are gone and the model still fits without headroom, allow it.
-            # Skip entirely when model memory limit is disabled (None).
-            if self._max_model_memory is not None:
-                kv_headroom = int(entry.estimated_size * 0.25)
-                required_with_headroom = entry.estimated_size + kv_headroom
+                # Case 2: Currently loading — grab event, wait outside lock
+                if entry.is_loading:
+                    loading_event = entry.loading_event
+                    # break out of the ``async with`` to wait below
+                else:
+                    # Case 3: Discovered but not loaded — start JIT load
+                    if (
+                        self._max_model_memory is not None
+                        and entry.estimated_size > self._max_model_memory
+                    ):
+                        raise ModelTooLargeError(
+                            model_id, entry.estimated_size, self._max_model_memory
+                        )
+
+                    entry.is_loading = True
+                    entry.loading_event.clear()
+                    need_load = True
+
+            if loading_event is not None:
+                # Case 2 continuation: wait for the in-progress load
+                await loading_event.wait()
+                async with self._lock:
+                    entry = self._entries.get(model_id)
+                    if entry is None or entry.engine is None:
+                        raise ModelLoadingError(
+                            f"Model {model_id} failed to load"
+                        )
+                    entry.last_access = time.time()
+                    return entry.engine
+
+            if need_load:
+                # Phase 2: Load outside the lock
                 try:
-                    await self._ensure_memory_available(required_with_headroom)
-                except InsufficientMemoryError:
-                    # Can't fit with headroom even after evicting everything possible.
-                    # Fall back to weights-only if that fits.
-                    if self._current_model_memory + entry.estimated_size <= self._max_model_memory:
-                        logger.info(
-                            f"Loading {model_id} without KV headroom "
-                            f"(need {format_size(required_with_headroom)}, "
-                            f"available {format_size(self._max_model_memory - self._current_model_memory)})"
-                        )
-                    else:
-                        await self._ensure_memory_available(entry.estimated_size)
+                    # Pre-load eviction with KV headroom (uses locked variant)
+                    if self._max_model_memory is not None:
+                        kv_headroom = int(entry.estimated_size * 0.25)
+                        required_with_headroom = entry.estimated_size + kv_headroom
+                        try:
+                            await self._ensure_memory_available(required_with_headroom)
+                        except InsufficientMemoryError:
+                            # Fall back to weights-only if that fits
+                            if self._current_model_memory + entry.estimated_size <= self._max_model_memory:
+                                logger.info(
+                                    f"Loading {model_id} without KV headroom "
+                                    f"(need {format_size(required_with_headroom)}, "
+                                    f"available {format_size(self._max_model_memory - self._current_model_memory)})"
+                                )
+                            else:
+                                await self._ensure_memory_available(entry.estimated_size)
 
-            # Check process memory limit before loading.
-            # Try evicting LRU models first to free actual Metal memory.
-            # max_bytes <= 0 means enforcement is disabled (no limit).
-            if self._process_memory_enforcer is not None:
-                enforcer = self._process_memory_enforcer
-                if enforcer.max_bytes > 0:
-                    while True:
-                        current_active = mx.get_active_memory()
-                        projected = current_active + entry.estimated_size
-                        if projected <= enforcer.max_bytes:
-                            break
-                        # Try to evict an LRU model to free memory
-                        victim = self._find_lru_victim()
-                        if victim is not None:
-                            logger.info(
-                                f"Evicting '{victim}' to fit '{model_id}' "
-                                f"within process memory limit "
-                                f"({format_size(projected)} > "
-                                f"{format_size(enforcer.max_bytes)})"
-                            )
-                            await self._unload_engine(victim)
-                            gc.collect()
-                            loop = asyncio.get_running_loop()
-                            await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
-                            continue
-                        # No more victims — cannot fit
-                        raise InsufficientMemoryError(
-                            required=entry.estimated_size,
-                            current=current_active,
-                            message=(
-                                f"Cannot load {model_id}: projected memory "
-                                f"{format_size(projected)} would exceed process "
-                                f"limit {format_size(enforcer.max_bytes)} "
-                                f"(current: {format_size(current_active)}, "
-                                f"model: {format_size(entry.estimated_size)})"
-                            ),
-                        )
+                    # Check process memory limit before loading
+                    if self._process_memory_enforcer is not None:
+                        enforcer = self._process_memory_enforcer
+                        if enforcer.max_bytes > 0:
+                            while True:
+                                current_active = mx.get_active_memory()
+                                projected = current_active + entry.estimated_size
+                                if projected <= enforcer.max_bytes:
+                                    break
+                                # Find victim under lock (reads _entries)
+                                async with self._lock:
+                                    victim = self._find_lru_victim()
+                                if victim is not None:
+                                    logger.info(
+                                        f"Evicting '{victim}' to fit '{model_id}' "
+                                        f"within process memory limit "
+                                        f"({format_size(projected)} > "
+                                        f"{format_size(enforcer.max_bytes)})"
+                                    )
+                                    await self._unload_engine(victim)
+                                    gc.collect()
+                                    loop = asyncio.get_running_loop()
+                                    await loop.run_in_executor(
+                                        get_mlx_executor(), mx.clear_cache
+                                    )
+                                    continue
+                                # No more victims — cannot fit
+                                raise InsufficientMemoryError(
+                                    required=entry.estimated_size,
+                                    current=current_active,
+                                    message=(
+                                        f"Cannot load {model_id}: projected memory "
+                                        f"{format_size(projected)} would exceed process "
+                                        f"limit {format_size(enforcer.max_bytes)} "
+                                        f"(current: {format_size(current_active)}, "
+                                        f"model: {format_size(entry.estimated_size)})"
+                                    ),
+                                )
 
-            # Now load the model
-            await self._load_engine(model_id)
-
-            return self._entries[model_id].engine
+                    # Now load the model (outside lock)
+                    await self._load_engine(model_id)
+                    return self._entries[model_id].engine
+                except Exception:
+                    # Reset loading state so waiters don't hang forever
+                    async with self._lock:
+                        if model_id in self._entries:
+                            self._entries[model_id].is_loading = False
+                            self._entries[model_id].loading_event.set()
+                    raise
 
     async def _ensure_memory_available(self, required: int) -> None:
+        """Evict LRU models to ensure memory is available. Acquires lock.
+
+        Use from outside the lock. For use inside the lock, call
+        ``_ensure_memory_available_unlocked`` instead.
+        """
+        async with self._lock:
+            await self._ensure_memory_available_unlocked(required)
+
+    async def _ensure_memory_available_unlocked(self, required: int) -> None:
         """
         Evict LRU models BEFORE loading to ensure we don't exceed memory limit.
+
+        Must be called while holding ``self._lock``.
 
         Args:
             required: Required memory in bytes
@@ -462,7 +503,7 @@ class EnginePool:
                         f"all loaded models are pinned."
                     ),
                 )
-            await self._unload_engine(victim)
+            await self._unload_engine_unlocked(victim)
 
     def _find_lru_victim(self) -> str | None:
         """
@@ -482,8 +523,15 @@ class EnginePool:
         return candidates[0][1]
 
     async def _unload_engine(self, model_id: str) -> None:
+        """Unload engine with lock acquisition. Use from outside the lock."""
+        async with self._lock:
+            await self._unload_engine_unlocked(model_id)
+
+    async def _unload_engine_unlocked(self, model_id: str) -> None:
         """
         Immediately stop and unload an engine.
+
+        Must be called while holding ``self._lock``.
 
         This aborts any in-progress requests.
 
@@ -654,6 +702,7 @@ class EnginePool:
         finally:
             entry.is_loading = False
             entry.abort_loading = False
+            entry.loading_event.set()
 
     async def preload_pinned_models(self) -> None:
         """
@@ -679,7 +728,7 @@ class EnginePool:
                 entry = self._entries.get(model_id)
                 if entry and entry.engine is not None:
                     try:
-                        await self._unload_engine(model_id)
+                        await self._unload_engine_unlocked(model_id)
                     except Exception as e:
                         logger.error(f"Error unloading {model_id} during shutdown: {e}")
 
@@ -769,7 +818,7 @@ class EnginePool:
                     f"TTL expired for model '{model_id}' "
                     f"(idle {idle_time:.0f}s > ttl {effective_ttl}s)"
                 )
-                await self._unload_engine(model_id)
+                await self._unload_engine_unlocked(model_id)
                 expired.append(model_id)
 
         return expired
