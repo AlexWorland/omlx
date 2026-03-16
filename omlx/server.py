@@ -310,7 +310,13 @@ async def lifespan(app: FastAPI):
                 watermark_critical=memory_settings.watermark_critical,
                 target_free_bytes=memory_settings.get_target_free_memory_bytes(),
                 max_evict_blocks_per_cycle=memory_settings.max_evict_blocks_per_cycle,
+                hysteresis_band=memory_settings.hysteresis_band,
+                system_memory_monitoring=memory_settings.system_memory_monitoring,
+                system_watermark_yellow=memory_settings.system_watermark_yellow,
+                system_watermark_red=memory_settings.system_watermark_red,
+                system_watermark_critical=memory_settings.system_watermark_critical,
             )
+            enforcer._global_ttl_seconds = memory_settings.global_ttl_seconds
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
             enforcer.start()
@@ -323,8 +329,12 @@ async def lifespan(app: FastAPI):
             while True:
                 try:
                     if _server_state.settings_manager is not None:
+                        global_ttl = 0
+                        if _server_state.global_settings is not None:
+                            global_ttl = _server_state.global_settings.memory.global_ttl_seconds
                         await _server_state.engine_pool.check_ttl_expirations(
-                            _server_state.settings_manager
+                            _server_state.settings_manager,
+                            global_ttl_seconds=global_ttl,
                         )
                 except asyncio.CancelledError:
                     break
@@ -333,6 +343,26 @@ async def lifespan(app: FastAPI):
                 await asyncio.sleep(1.0)
 
         ttl_task = asyncio.create_task(_ttl_check_loop())
+
+    # Start periodic model rescan if configured
+    rescan_task = None
+    if _server_state.engine_pool is not None:
+        scan_interval = 60
+        if _server_state.global_settings is not None:
+            scan_interval = _server_state.global_settings.memory.model_scan_interval_seconds
+
+        if scan_interval > 0:
+            async def _model_rescan_loop():
+                while True:
+                    try:
+                        await asyncio.sleep(scan_interval)
+                        _server_state.engine_pool.rescan_models()
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.error(f"Model rescan error: {e}")
+
+            rescan_task = asyncio.create_task(_model_rescan_loop())
 
     # Initialize MCP if config provided
     # Priority: env var > settings.json
@@ -350,6 +380,12 @@ async def lifespan(app: FastAPI):
         ttl_task.cancel()
         try:
             await ttl_task
+        except asyncio.CancelledError:
+            pass
+    if rescan_task is not None:
+        rescan_task.cancel()
+        try:
+            await rescan_task
         except asyncio.CancelledError:
             pass
     if _server_state.process_memory_enforcer is not None:
@@ -1202,11 +1238,22 @@ async def health():
             "current_model_memory": _server_state.engine_pool.current_model_memory,
         }
 
+    memory_pressure = None
+    enforcer = _server_state.process_memory_enforcer
+    if enforcer is not None:
+        status = enforcer.get_status()
+        memory_pressure = {
+            "zone": status["pressure_zone"],
+            "utilization": status["utilization"],
+            "prefill_paused": status["prefill_paused"],
+        }
+
     return {
         "status": "healthy",
         "default_model": _server_state.default_model,
         "engine_pool": pool_status,
         "mcp": mcp_info,
+        "memory_pressure": memory_pressure,
     }
 
 
