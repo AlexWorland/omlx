@@ -50,21 +50,26 @@ except ImportError:
 
 
 # --- Async I/O constants ---
-def _compute_max_pending_writes() -> int:
+def _compute_max_pending_writes(hot_cache_enabled: bool = False) -> int:
     """Compute max pending writes queue depth based on system memory.
 
     The background writer now handles full safetensors file writes (not just
     renames), so the queue needs to be deeper to absorb burst saves from
     large requests (e.g., 64 blocks per 4096-token request).
 
-    Scales proportionally: 512GB = 256, 32GB = 32, minimum 32.
+    When hot_cache is enabled: scales aggressively (128–512 slots) since
+    hot cache evictions create write bursts that need deeper buffering.
+    When hot_cache is disabled: scales conservatively (32–256 slots).
     """
     try:
         total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         total_gb = total_bytes / (1024 ** 3)
-        return max(32, min(256, int(total_gb / 2)))
+        if hot_cache_enabled:
+            return max(128, min(512, int(total_gb)))
+        else:
+            return max(32, min(256, int(total_gb / 2)))
     except (ValueError, OSError):
-        return 32  # Safe default
+        return 128 if hot_cache_enabled else 32  # Safe defaults
 
 
 _MAX_PENDING_WRITES = _compute_max_pending_writes()
@@ -561,6 +566,7 @@ class PagedSSDCacheManager(CacheManager):
             "hot_cache_evictions": 0,
             "hot_cache_promotions": 0,
         }
+        self._write_queue_drops: int = 0
 
         # --- Hot cache (in-memory raw-bytes tier) ---
         self._hot_cache_max_bytes = hot_cache_max_bytes
@@ -574,7 +580,8 @@ class PagedSSDCacheManager(CacheManager):
         self._scan_existing_files()
 
         # --- Background writer for non-blocking saves ---
-        self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
+        _queue_depth = _compute_max_pending_writes(self._hot_cache_enabled)
+        self._write_queue: queue.Queue = queue.Queue(maxsize=_queue_depth)
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
         self._pending_write_hashes_lock = threading.Lock()
@@ -657,8 +664,8 @@ class PagedSSDCacheManager(CacheManager):
         with self._pending_write_hashes_lock:
             self._pending_write_hashes.add(block_hash)
         try:
-            self._write_queue.put_nowait(
-                (block_hash, tensors_raw, metadata, file_path)
+            self._write_queue.put(
+                (block_hash, tensors_raw, metadata, file_path), timeout=0.1
             )
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
@@ -666,11 +673,16 @@ class PagedSSDCacheManager(CacheManager):
             )
             return True
         except queue.Full:
+            self._write_queue_drops += 1
             logger.warning(
-                f"SSD write queue full, dropping evicted block "
-                f"{block_hash.hex()[:16]}"
+                f"SSD write queue full (drops={self._write_queue_drops}), "
+                f"dropping evicted block {block_hash.hex()[:16]}"
             )
-            self._index.remove(block_hash)
+            # Only remove from index if no SSD file exists yet.
+            # If the block was previously written to SSD, the index entry
+            # pointing to the existing file is still valid — keep it.
+            if not file_path.exists():
+                self._index.remove(block_hash)
             with self._pending_write_hashes_lock:
                 self._pending_write_hashes.discard(block_hash)
             return False
@@ -715,6 +727,36 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["hot_cache_promotions"] += 1
         except Exception:
             pass  # Promotion failure is non-critical
+
+    def shrink_hot_cache(self, target_bytes: int) -> int:
+        """Evict LRU hot cache entries until _hot_cache_total_bytes <= target_bytes.
+
+        Evicted entries are flushed to SSD via the background writer thread.
+
+        Args:
+            target_bytes: Target maximum hot cache size in bytes.
+
+        Returns:
+            Number of entries evicted.
+        """
+        if not self._hot_cache:
+            return 0
+
+        evicted_entries: list = []
+        with self._hot_cache_lock:
+            while self._hot_cache_total_bytes > target_bytes and self._hot_cache:
+                evicted_hash, evicted = self._hot_cache.popitem(last=False)
+                self._hot_cache_total_bytes -= self._hot_cache_entry_size(
+                    evicted['tensors_raw']
+                )
+                self._stats["hot_cache_evictions"] += 1
+                evicted_entries.append((evicted_hash, evicted))
+
+        # Flush evicted entries to SSD outside the hot cache lock
+        for evicted_hash, evicted in evicted_entries:
+            self._enqueue_ssd_write(evicted_hash, evicted)
+
+        return len(evicted_entries)
 
     def _init_directories(self) -> None:
         """Create cache directory structure."""
@@ -1092,13 +1134,14 @@ class PagedSSDCacheManager(CacheManager):
 
             # Enqueue full file write for background thread
             try:
-                self._write_queue.put_nowait(
-                    (block_hash, tensors_raw, metadata, file_path)
+                self._write_queue.put(
+                    (block_hash, tensors_raw, metadata, file_path), timeout=0.1
                 )
             except queue.Full:
+                self._write_queue_drops += 1
                 logger.warning(
-                    f"SSD cache write queue full, dropping write for "
-                    f"{block_hash.hex()[:16]}"
+                    f"SSD cache write queue full (drops={self._write_queue_drops}), "
+                    f"dropping write for {block_hash.hex()[:16]}"
                 )
                 self._index.remove(block_hash)
                 self._hot_cache_remove(block_hash)
@@ -1647,6 +1690,7 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
+                write_queue_drops=self._write_queue_drops,
             )
 
     def get_stats_dict(self) -> Dict[str, Any]:
@@ -1682,6 +1726,7 @@ class PagedSSDCacheManager(CacheManager):
                 "hot_cache_max_bytes": self._hot_cache_max_bytes,
                 "hot_cache_size_formatted": format_bytes(hot_size),
                 "hot_cache_max_formatted": format_bytes(self._hot_cache_max_bytes),
+                "write_queue_drops": self._write_queue_drops,
                 **self._stats,
             }
 

@@ -189,6 +189,9 @@ class PagedSSDCacheStats(BaseCacheStats):
     hot_cache_evictions: int = 0
     hot_cache_promotions: int = 0
 
+    # Write queue backpressure metrics
+    write_queue_drops: int = 0
+
     @property
     def save_rate(self) -> float:
         """Calculate successful save rate."""

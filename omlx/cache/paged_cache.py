@@ -681,6 +681,13 @@ class PagedCacheManager(CacheManager):
         if block.block_hash is None:
             return False
 
+        # Never evict a block that is owned by an active request.
+        # This guards the lazy-restore race: a block allocated with ref_count=0
+        # may have been incremented to 1 by fetch_cache between allocation and
+        # the next eviction scan.
+        if block.ref_count > 0:
+            return False
+
         evicted = self.cached_block_hash_to_block.pop(
             block.block_hash, block.block_id
         )
@@ -701,7 +708,7 @@ class PagedCacheManager(CacheManager):
         """
         with self._lock:
             if block_id not in self.allocated_blocks:
-                logger.warning(f"Attempted to free unknown block: {block_id}")
+                logger.debug(f"Attempted to free unknown block: {block_id}")
                 return False
 
             block = self.allocated_blocks[block_id]
@@ -961,6 +968,11 @@ class PagedCacheManager(CacheManager):
                 # Lazy restore: if not in memory but exists on SSD, register it
                 if cached_block is None and self._paged_ssd_cache_manager is not None:
                     if self._paged_ssd_cache_manager.has_block(block_hash):
+                        # Lazy-restore: block exists in SSD but not in memory. Allocate
+                        # metadata-only block. ref_count starts at 0 here but will be
+                        # incremented by fetch_cache before the block is used. The eviction
+                        # guard in _maybe_evict_cached_block prevents evicting blocks with
+                        # ref_count > 0.
                         # Use standard allocation path so we handle an empty
                         # free queue gracefully (grow/evict) and keep stats in sync.
                         block = self.allocate_block()
