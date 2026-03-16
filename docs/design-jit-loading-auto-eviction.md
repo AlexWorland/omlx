@@ -49,7 +49,7 @@ No new state machine. Model state is derived from the existing `_entries` dictio
 | **Discovered** | `EngineEntry` in `_entries` with `engine=None` and `is_loading=False` |
 | **Loading** | `EngineEntry` in `_entries` with `is_loading=True` and `loading_event` not yet set |
 | **Loaded** | `EngineEntry` in `_entries` with `engine` set and `loading_event` signaled |
-| **Evicted** | `EngineEntry` removed from `_entries`; re-discoverable via rescan |
+| **Evicted** | `EngineEntry` in `_entries` with `engine=None` (returned to Discovered state, immediately available for JIT reload) |
 
 No separate `_model_registry` — the existing `_entries` dict already tracks both discovered and loaded models. The `discover_models()` method populates `_entries` with unloaded entries (`engine=None`). After TTL eviction, a model is removed from `_entries` and rediscovered on the next rescan cycle.
 
@@ -94,7 +94,7 @@ For each loaded model (EngineEntry in _entries where engine is not None):
   6. If idle_time > effective_ttl:
      a. Log: "Auto-evicting {model_id} after {idle_time}s idle (TTL: {effective_ttl}s)"
      b. Call _unload_engine(model_id)
-     c. Model removed from _entries (rediscovered on next rescan, or on explicit /load call)
+     c. Model stays in _entries with engine=None (returned to Discovered state, immediately available for JIT reload without waiting for rescan)
 ```
 
 ### Per-Model TTL Override
@@ -117,7 +117,9 @@ async def _model_rescan_loop(pool: EnginePool, interval: int = 60):
 
 ### rescan_models()
 
-New method on `EnginePool`. Uses `self._model_dirs` (stored at init from the `model_dirs` argument passed to `discover_models()`) and `settings_manager.get_pinned_model_ids()` for pinned status:
+New method on `EnginePool`. Requires two new pieces of infrastructure:
+- `self._model_dirs: list[Path]` — store the model directories after `discover_models()` is first called (new; currently passed as a parameter and not stored)
+- Pinned model IDs — read from `ModelSettingsManager` by checking `settings.is_pinned` for each model (existing per-model field, no new method needed)
 
 ```
 rescan_models(settings_manager):
@@ -178,7 +180,7 @@ get_engine(model_id) -> Engine:
        → Return engine
 
     3. If model_id in _entries and not loaded (engine=None, discovered state):
-       → Create placeholder EngineEntry with is_loading=True, loading_event unset
+       → Set existing entry's is_loading=True, reset loading_event
        → Release lock
        → JIT load path (see below)
 
@@ -191,7 +193,8 @@ get_engine(model_id) -> Engine:
 ```
 JIT load (model_id):  [lock NOT held]
   1. _ensure_memory_available(weight_size_bytes)
-     - May evict LRU models to make room (acquires lock internally)
+     - May evict LRU models to make room
+     - NOTE: Currently called under lock; in the new two-phase design, must acquire lock internally for eviction
 
   If jit_loading_behavior == "block":
     2. _load_engine(model_id, model_path)  [loads weights, may take 10-60s]
@@ -316,7 +319,7 @@ Already exists. No changes needed.
 
 These are independent systems that complement each other:
 
-- **TTL eviction**: Time-based, predictable, runs every 30s. Frees memory proactively.
+- **TTL eviction**: Time-based, predictable, runs on existing poll interval (~1s). Frees memory proactively.
 - **Pressure eviction**: Reactive, triggered by memory zones. Frees memory urgently.
 
 TTL eviction reduces the frequency of pressure eviction by keeping memory cleaner. The memory pressure system remains unchanged — if a model is loaded and memory hits CRITICAL, the existing `_evict_all_non_pinned()` still fires regardless of TTL.
