@@ -359,6 +359,9 @@ class TestJITLoading:
                 await asyncio.sleep(0.05)
                 pool._entries[mid].engine = mock_engine
                 pool._entries[mid].last_access = time.time()
+                # Must replicate what real _load_engine's finally block does
+                pool._entries[mid].is_loading = False
+                pool._entries[mid].loading_event.set()
 
             with patch.object(pool, "_load_engine", side_effect=slow_load):
                 results = await asyncio.gather(
