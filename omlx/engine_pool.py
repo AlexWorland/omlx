@@ -99,6 +99,7 @@ class EnginePool:
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
+        self._model_dirs: list = []
 
     @property
     def max_model_memory(self) -> int | None:
@@ -138,6 +139,8 @@ class EnginePool:
             dirs = [Path(model_dirs)]
         else:
             dirs = [Path(d) for d in model_dirs]
+
+        self._model_dirs = dirs
 
         if len(dirs) == 1:
             discovered = discover_models(dirs[0])
@@ -187,6 +190,58 @@ class EnginePool:
             f"Discovered {len(self._entries)} models, "
             f"max memory: {mem_display}"
         )
+
+    def rescan_models(self) -> tuple[list[str], list[str]]:
+        """Rescan model directories for new or removed models.
+
+        Returns:
+            Tuple of (added_model_ids, removed_model_ids).
+        """
+        from .model_discovery import discover_models_from_dirs
+
+        if not self._model_dirs:
+            return [], []
+
+        if len(self._model_dirs) == 1:
+            discovered = discover_models(self._model_dirs[0])
+        else:
+            discovered = discover_models_from_dirs(self._model_dirs)
+
+        pinned_set = {mid for mid, e in self._entries.items() if e.is_pinned}
+
+        added = []
+        for model_id, info in discovered.items():
+            if model_id not in self._entries:
+                self._entries[model_id] = EngineEntry(
+                    model_id=model_id,
+                    model_path=info.model_path,
+                    model_type=info.model_type,
+                    engine_type=info.engine_type,
+                    estimated_size=info.estimated_size,
+                    config_model_type=getattr(info, "config_model_type", ""),
+                    is_pinned=model_id in pinned_set,
+                )
+                added.append(model_id)
+                logger.info(
+                    f"Hot-added model: {model_id} "
+                    f"({format_size(info.estimated_size)})"
+                )
+
+        discovered_ids = set(discovered.keys())
+        removed = []
+        for mid in list(self._entries.keys()):
+            if mid not in discovered_ids:
+                entry = self._entries[mid]
+                if entry.engine is not None:
+                    logger.warning(
+                        f"Model files removed but model is loaded, keeping: {mid}"
+                    )
+                else:
+                    del self._entries[mid]
+                    removed.append(mid)
+                    logger.info(f"Model removed (files no longer present): {mid}")
+
+        return added, removed
 
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
         "llm": "batched",

@@ -222,3 +222,67 @@ class TestTTLEviction:
             assert "m1" in pool._entries
 
         asyncio.run(_run())
+
+
+# =========================================================================
+# Rescan Models
+# =========================================================================
+
+from unittest.mock import patch
+
+
+class TestRescanModels:
+    def test_rescan_finds_new_model(self):
+        pool = EnginePool(max_model_memory=None, scheduler_config=MagicMock())
+        pool._entries = {"model-a": _make_mock_entry("model-a")}
+        pool._model_dirs = ["/tmp/models"]
+
+        with patch("omlx.engine_pool.discover_models") as mock_discover:
+            mock_discover.return_value = {
+                "model-a": MagicMock(model_path="/tmp/models/model-a", model_type="llm",
+                                      engine_type="batched", estimated_size=1000, config_model_type=""),
+                "model-b": MagicMock(model_path="/tmp/models/model-b", model_type="llm",
+                                      engine_type="batched", estimated_size=2000, config_model_type=""),
+            }
+            added, removed = pool.rescan_models()
+
+        assert "model-b" in pool._entries
+        assert "model-b" in added
+        assert len(removed) == 0
+
+    def test_rescan_removes_missing_unloaded_model(self):
+        pool = EnginePool(max_model_memory=None, scheduler_config=MagicMock())
+        pool._entries = {
+            "model-a": _make_mock_entry("model-a"),
+            "model-b": _make_mock_entry("model-b"),
+        }
+        pool._model_dirs = ["/tmp/models"]
+
+        with patch("omlx.engine_pool.discover_models") as mock_discover:
+            mock_discover.return_value = {
+                "model-a": MagicMock(model_path="/tmp/models/model-a", model_type="llm",
+                                      engine_type="batched", estimated_size=1000, config_model_type=""),
+            }
+            added, removed = pool.rescan_models()
+
+        assert "model-b" not in pool._entries
+        assert "model-b" in removed
+
+    def test_rescan_keeps_loaded_model_even_if_files_gone(self):
+        pool = EnginePool(max_model_memory=None, scheduler_config=MagicMock())
+        loaded_entry = _make_mock_entry("model-b", engine=MagicMock())
+        pool._entries = {
+            "model-a": _make_mock_entry("model-a"),
+            "model-b": loaded_entry,
+        }
+        pool._model_dirs = ["/tmp/models"]
+
+        with patch("omlx.engine_pool.discover_models") as mock_discover:
+            mock_discover.return_value = {
+                "model-a": MagicMock(model_path="/tmp/models/model-a", model_type="llm",
+                                      engine_type="batched", estimated_size=1000, config_model_type=""),
+            }
+            added, removed = pool.rescan_models()
+
+        assert "model-b" in pool._entries
+        assert "model-b" not in removed
