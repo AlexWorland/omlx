@@ -123,19 +123,30 @@
                                 <span class="text-sm font-semibold text-neutral-500"
                                       x-text="stats.memory_pressure ? (stats.memory_pressure.utilization * 100).toFixed(1) + '%' : ''"></span>
                             </div>
+                            <!-- Metal VRAM label -->
+                            <span class="text-[10px] font-semibold uppercase tracking-wider text-neutral-400 mb-1 block">{{ t('status.memory_pressure.metal_vram') }}</span>
                             <!-- Segmented progress bar -->
                             <div x-show="stats.memory_pressure" class="relative h-4 rounded-full overflow-hidden"
                                  :style="stats.memory_pressure ? 'background:linear-gradient(to right,rgba(34,197,94,0.15) 0%,rgba(34,197,94,0.15) ' + (stats.memory_pressure.watermarks.yellow*100) + '%,rgba(245,158,11,0.15) ' + (stats.memory_pressure.watermarks.yellow*100) + '%,rgba(245,158,11,0.15) ' + (stats.memory_pressure.watermarks.red*100) + '%,rgba(239,68,68,0.15) ' + (stats.memory_pressure.watermarks.red*100) + '%,rgba(239,68,68,0.15) ' + (stats.memory_pressure.watermarks.critical*100) + '%,rgba(185,28,28,0.2) ' + (stats.memory_pressure.watermarks.critical*100) + '%,rgba(185,28,28,0.2) 100%)' : ''">
-                                <!-- Current utilization fill -->
-                                <div style="position:absolute;top:0;bottom:0;left:0;border-radius:0 9999px 9999px 0;transition:width 0.5s"
-                                     :style="stats.memory_pressure ? 'width:' + Math.min(100, stats.memory_pressure.utilization * 100) + '%;background-color:' + pressureZoneColor(stats.memory_pressure.pressure_zone) : ''"></div>
+                                <!-- VRAM breakdown segments (stacked left-to-right) -->
+                                <template x-if="stats.memory_breakdown && stats.memory_pressure.max_bytes > 0">
+                                    <div>
+                                        <!-- Model Weights (green) -->
+                                        <div :style="'position:absolute;top:0;bottom:0;left:0;transition:width 0.5s;background-color:#22c55e;width:' + (stats.memory_breakdown.model_weights / stats.memory_pressure.max_bytes * 100) + '%'"></div>
+                                        <!-- Hot KV Cache (cyan) -->
+                                        <div :style="'position:absolute;top:0;bottom:0;transition:width 0.5s,left 0.5s;background-color:#06b6d4;left:' + (stats.memory_breakdown.model_weights / stats.memory_pressure.max_bytes * 100) + '%;width:' + (stats.memory_breakdown.hot_cache / stats.memory_pressure.max_bytes * 100) + '%'"></div>
+                                        <!-- Overhead (amber) -->
+                                        <div :style="'position:absolute;top:0;bottom:0;border-radius:0 9999px 9999px 0;transition:width 0.5s,left 0.5s;background-color:#f59e0b;left:' + ((stats.memory_breakdown.model_weights + stats.memory_breakdown.hot_cache) / stats.memory_pressure.max_bytes * 100) + '%;width:' + (stats.memory_breakdown.overhead / stats.memory_pressure.max_bytes * 100) + '%'"></div>
+                                    </div>
+                                </template>
+                                <!-- Fallback: single fill when no breakdown data -->
+                                <template x-if="!stats.memory_breakdown">
+                                    <div :style="stats.memory_pressure ? 'position:absolute;top:0;bottom:0;left:0;border-radius:0 9999px 9999px 0;transition:width 0.5s;width:' + Math.min(100, stats.memory_pressure.utilization * 100) + '%;background-color:' + pressureZoneColor(stats.memory_pressure.pressure_zone) : ''"></div>
+                                </template>
                                 <!-- Watermark ticks -->
-                                <div style="position:absolute;top:0;bottom:0;width:1px;background-color:#f59e0b;opacity:0.5"
-                                     :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.yellow * 100) + '%' : ''"></div>
-                                <div style="position:absolute;top:0;bottom:0;width:1px;background-color:#ef4444;opacity:0.5"
-                                     :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.red * 100) + '%' : ''"></div>
-                                <div style="position:absolute;top:0;bottom:0;width:1px;background-color:#991b1b;opacity:0.5"
-                                     :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.critical * 100) + '%' : ''"></div>
+                                <div :style="stats.memory_pressure ? 'position:absolute;top:0;bottom:0;width:1px;background-color:#f59e0b;opacity:0.5;left:' + (stats.memory_pressure.watermarks.yellow * 100) + '%' : ''"></div>
+                                <div :style="stats.memory_pressure ? 'position:absolute;top:0;bottom:0;width:1px;background-color:#ef4444;opacity:0.5;left:' + (stats.memory_pressure.watermarks.red * 100) + '%' : ''"></div>
+                                <div :style="stats.memory_pressure ? 'position:absolute;top:0;bottom:0;width:1px;background-color:#991b1b;opacity:0.5;left:' + (stats.memory_pressure.watermarks.critical * 100) + '%' : ''"></div>
                             </div>
                             <!-- Watermark labels -->
                             <div x-show="stats.memory_pressure" class="relative mt-1 h-4">
@@ -148,6 +159,73 @@
                                 <span class="absolute text-[10px] text-red-700 font-medium -translate-x-1/2"
                                       :style="stats.memory_pressure ? 'left:' + (stats.memory_pressure.watermarks.critical * 100) + '%' : ''"
                                       x-text="stats.memory_pressure ? (stats.memory_pressure.watermarks.critical * 100).toFixed(0) + '%' : ''"></span>
+                            </div>
+                            <!-- System RAM bar -->
+                            <div x-show="stats.memory_pressure && stats.memory_pressure.system_memory && stats.memory_pressure.system_memory.enabled" class="mt-4">
+                                <div class="flex items-baseline justify-between mb-1">
+                                    <span class="text-[10px] font-semibold uppercase tracking-wider text-neutral-400">{{ t('status.memory_pressure.system_ram') }}</span>
+                                    <div class="flex items-baseline gap-2">
+                                        <span class="text-sm font-bold text-neutral-900"
+                                              x-text="stats.memory_pressure && stats.memory_pressure.system_memory ? stats.memory_pressure.system_memory.available_formatted + ' free / ' + stats.memory_pressure.system_memory.total_formatted : ''"></span>
+                                        <span class="text-sm font-semibold text-neutral-500"
+                                              x-text="stats.memory_pressure && stats.memory_pressure.system_memory ? (stats.memory_pressure.system_memory.utilization * 100).toFixed(1) + '%' : ''"></span>
+                                    </div>
+                                </div>
+                                <!-- Progress bar -->
+                                <div class="relative h-4 rounded-full overflow-hidden"
+                                     :style="'background-color: rgba(0,0,0,0.06)'">
+                                    <div :style="stats.memory_pressure && stats.memory_pressure.system_memory ? 'position:absolute;top:0;bottom:0;left:0;border-radius:0 9999px 9999px 0;transition:width 0.5s;width:' + Math.min(100, stats.memory_pressure.system_memory.utilization * 100) + '%;background-color:' + pressureZoneColor(stats.memory_pressure.system_memory.pressure_zone) : ''"></div>
+                                    <!-- System watermark ticks -->
+                                    <div :style="stats.memory_pressure && stats.memory_pressure.system_memory ? 'position:absolute;top:0;bottom:0;width:1px;background-color:#f59e0b;opacity:0.5;left:' + (stats.memory_pressure.system_memory.watermarks.yellow * 100) + '%' : ''"></div>
+                                    <div :style="stats.memory_pressure && stats.memory_pressure.system_memory ? 'position:absolute;top:0;bottom:0;width:1px;background-color:#ef4444;opacity:0.5;left:' + (stats.memory_pressure.system_memory.watermarks.red * 100) + '%' : ''"></div>
+                                    <div :style="stats.memory_pressure && stats.memory_pressure.system_memory ? 'position:absolute;top:0;bottom:0;width:1px;background-color:#991b1b;opacity:0.5;left:' + (stats.memory_pressure.system_memory.watermarks.critical * 100) + '%' : ''"></div>
+                                </div>
+                                <!-- System watermark labels -->
+                                <div class="relative mt-1 h-4">
+                                    <span class="absolute text-[10px] text-amber-600 font-medium -translate-x-1/2"
+                                          :style="stats.memory_pressure && stats.memory_pressure.system_memory ? 'left:' + (stats.memory_pressure.system_memory.watermarks.yellow * 100) + '%' : ''"
+                                          x-text="stats.memory_pressure && stats.memory_pressure.system_memory ? (stats.memory_pressure.system_memory.watermarks.yellow * 100).toFixed(0) + '%' : ''"></span>
+                                    <span class="absolute text-[10px] text-red-600 font-medium -translate-x-1/2"
+                                          :style="stats.memory_pressure && stats.memory_pressure.system_memory ? 'left:' + (stats.memory_pressure.system_memory.watermarks.red * 100) + '%' : ''"
+                                          x-text="stats.memory_pressure && stats.memory_pressure.system_memory ? (stats.memory_pressure.system_memory.watermarks.red * 100).toFixed(0) + '%' : ''"></span>
+                                    <span class="absolute text-[10px] text-red-700 font-medium -translate-x-1/2"
+                                          :style="stats.memory_pressure && stats.memory_pressure.system_memory ? 'left:' + (stats.memory_pressure.system_memory.watermarks.critical * 100) + '%' : ''"
+                                          x-text="stats.memory_pressure && stats.memory_pressure.system_memory ? (stats.memory_pressure.system_memory.watermarks.critical * 100).toFixed(0) + '%' : ''"></span>
+                                </div>
+                            </div>
+                            <!-- VRAM breakdown legend -->
+                            <div x-show="stats.memory_breakdown" x-cloak class="flex items-center gap-4 mt-1">
+                                <div class="flex items-center gap-1.5">
+                                    <span class="w-2.5 h-2.5 rounded-sm" style="background-color:#22c55e"></span>
+                                    <span class="text-[11px] text-neutral-600" x-text="t('status.memory_pressure.weights') + ' ' + formatSizeBytes(stats.memory_breakdown ? stats.memory_breakdown.model_weights : 0)"></span>
+                                </div>
+                                <div class="flex items-center gap-1.5">
+                                    <span class="w-2.5 h-2.5 rounded-sm" style="background-color:#06b6d4"></span>
+                                    <span class="text-[11px] text-neutral-600" x-text="t('status.memory_pressure.hot_cache') + ' ' + formatSizeBytes(stats.memory_breakdown ? stats.memory_breakdown.hot_cache : 0)"></span>
+                                </div>
+                                <div class="flex items-center gap-1.5">
+                                    <span class="w-2.5 h-2.5 rounded-sm" style="background-color:#f59e0b"></span>
+                                    <span class="text-[11px] text-neutral-600" x-text="t('status.memory_pressure.overhead') + ' ' + formatSizeBytes(stats.memory_breakdown ? stats.memory_breakdown.overhead : 0)"></span>
+                                </div>
+                            </div>
+                            <!-- Zone color key (shown when no VRAM breakdown) -->
+                            <div x-show="!stats.memory_breakdown" x-cloak class="flex items-center gap-4 mt-1">
+                                <div class="flex items-center gap-1.5">
+                                    <span class="w-2.5 h-2.5 rounded-sm" style="background-color:#22c55e"></span>
+                                    <span class="text-[11px] text-neutral-600">{{ t('status.memory_pressure.zone_green') }}</span>
+                                </div>
+                                <div class="flex items-center gap-1.5">
+                                    <span class="w-2.5 h-2.5 rounded-sm" style="background-color:#f59e0b"></span>
+                                    <span class="text-[11px] text-neutral-600">{{ t('status.memory_pressure.zone_yellow') }}</span>
+                                </div>
+                                <div class="flex items-center gap-1.5">
+                                    <span class="w-2.5 h-2.5 rounded-sm" style="background-color:#ef4444"></span>
+                                    <span class="text-[11px] text-neutral-600">{{ t('status.memory_pressure.zone_red') }}</span>
+                                </div>
+                                <div class="flex items-center gap-1.5">
+                                    <span class="w-2.5 h-2.5 rounded-sm" style="background-color:#b91c1c"></span>
+                                    <span class="text-[11px] text-neutral-600">{{ t('status.memory_pressure.zone_critical') }}</span>
+                                </div>
                             </div>
                         </div>
                         <!-- Footer indicators -->
@@ -179,6 +257,23 @@
                                 </template>
                                 <template x-if="stats.memory_pressure && !stats.memory_pressure.pressure_management_enabled">
                                     <span class="px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-500 text-xs font-semibold">{{ t('status.memory_pressure.zone_mgmt_off') }}</span>
+                                </template>
+                            </div>
+                            <!-- Zone Driver pill -->
+                            <div class="flex items-center gap-1.5">
+                                <span class="text-xs text-neutral-500 font-medium">{{ t('status.memory_pressure.zone_driver') }}:</span>
+                                <span class="px-2 py-0.5 rounded-full text-xs font-semibold"
+                                      :class="stats.memory_pressure && stats.memory_pressure.zone_driver === 'system' ? 'bg-purple-100 text-purple-700' : stats.memory_pressure && stats.memory_pressure.zone_driver === 'both' ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'"
+                                      x-text="stats.memory_pressure ? stats.memory_pressure.zone_driver : ''"></span>
+                            </div>
+                            <!-- System RAM Monitoring pill -->
+                            <div x-show="stats.memory_pressure && stats.memory_pressure.system_memory" class="flex items-center gap-1.5">
+                                <span class="text-xs text-neutral-500 font-medium">{{ t('status.memory_pressure.system_monitoring') }}:</span>
+                                <template x-if="stats.memory_pressure && stats.memory_pressure.system_memory && stats.memory_pressure.system_memory.enabled">
+                                    <span class="px-2 py-0.5 rounded-full bg-green-100 text-green-700 text-xs font-semibold">{{ t('status.memory_pressure.system_monitoring_on') }}</span>
+                                </template>
+                                <template x-if="stats.memory_pressure && stats.memory_pressure.system_memory && !stats.memory_pressure.system_memory.enabled">
+                                    <span class="px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-500 text-xs font-semibold">{{ t('status.memory_pressure.system_monitoring_off') }}</span>
                                 </template>
                             </div>
                         </div>
@@ -246,9 +341,14 @@
                                                 </template>
                                                 <!-- Idle -->
                                                 <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests === 0">
-                                                    <div class="flex items-center gap-1.5">
-                                                        <span class="w-2 h-2 rounded-full bg-neutral-300"></span>
-                                                        <span class="text-xs text-neutral-400">idle</span>
+                                                    <div class="flex items-center gap-2">
+                                                        <div class="flex items-center gap-1.5">
+                                                            <span class="w-2 h-2 rounded-full bg-neutral-300"></span>
+                                                            <span class="text-xs text-neutral-400" x-text="m.idle_seconds != null ? window.t('settings.lifecycle.idle_for') + ' ' + formatDuration(m.idle_seconds) : 'idle'"></span>
+                                                        </div>
+                                                        <template x-if="m.evicts_in_seconds != null">
+                                                            <span class="text-[10px] text-amber-500 font-medium" x-text="window.t('settings.lifecycle.evicts_in') + ' ' + formatDuration(m.evicts_in_seconds)"></span>
+                                                        </template>
                                                     </div>
                                                 </template>
                                             </div>

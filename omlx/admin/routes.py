@@ -116,6 +116,10 @@ class GlobalSettingsRequest(BaseModel):
     target_free_memory: Optional[str] = None  # "disabled", "auto", or "XGB"
     watermark_yellow: Optional[float] = None
     watermark_red: Optional[float] = None
+    system_memory_monitoring: Optional[bool] = None
+    system_watermark_yellow: Optional[float] = None
+    system_watermark_red: Optional[float] = None
+    system_watermark_critical: Optional[float] = None
 
     # Scheduler settings
     max_num_seqs: Optional[int] = None
@@ -158,6 +162,11 @@ class GlobalSettingsRequest(BaseModel):
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
     integrations_openclaw_tools_profile: Optional[str] = None
+
+    # Model lifecycle settings
+    global_ttl_seconds: Optional[int] = None
+    model_scan_interval_seconds: Optional[int] = None
+    jit_loading_behavior: Optional[str] = None
 
     # UI settings
     ui_language: Optional[str] = None
@@ -478,6 +487,10 @@ async def _apply_max_process_memory_runtime(
             watermark_critical=global_settings.memory.watermark_critical,
             target_free_bytes=global_settings.memory.get_target_free_memory_bytes(),
             max_evict_blocks_per_cycle=global_settings.memory.max_evict_blocks_per_cycle,
+            system_memory_monitoring=global_settings.memory.system_memory_monitoring,
+            system_watermark_yellow=global_settings.memory.system_watermark_yellow,
+            system_watermark_red=global_settings.memory.system_watermark_red,
+            system_watermark_critical=global_settings.memory.system_watermark_critical,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -501,12 +514,18 @@ def _apply_pressure_settings_runtime(memory_settings) -> None:
     enforcer._watermark_red = memory_settings.watermark_red
     target_free = memory_settings.get_target_free_memory_bytes()
     enforcer._target_free_bytes = target_free
+    # System RAM monitoring settings
+    enforcer._system_monitoring_enabled = memory_settings.system_memory_monitoring
+    enforcer._sys_watermark_yellow = memory_settings.system_watermark_yellow
+    enforcer._sys_watermark_red = memory_settings.system_watermark_red
+    enforcer._sys_watermark_critical = memory_settings.system_watermark_critical
     logger.info(
         f"Pressure management settings updated: "
         f"enabled={memory_settings.pressure_management_enabled}, "
         f"yellow={memory_settings.watermark_yellow}, "
         f"red={memory_settings.watermark_red}, "
-        f"target_free={memory_settings.target_free_memory}"
+        f"target_free={memory_settings.target_free_memory}, "
+        f"system_monitoring={memory_settings.system_memory_monitoring}"
     )
 
 
@@ -1664,6 +1683,13 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "target_free_memory": global_settings.memory.target_free_memory,
             "watermark_yellow": global_settings.memory.watermark_yellow,
             "watermark_red": global_settings.memory.watermark_red,
+            "system_memory_monitoring": global_settings.memory.system_memory_monitoring,
+            "system_watermark_yellow": global_settings.memory.system_watermark_yellow,
+            "system_watermark_red": global_settings.memory.system_watermark_red,
+            "system_watermark_critical": global_settings.memory.system_watermark_critical,
+            "global_ttl_seconds": global_settings.memory.global_ttl_seconds,
+            "model_scan_interval_seconds": global_settings.memory.model_scan_interval_seconds,
+            "jit_loading_behavior": global_settings.memory.jit_loading_behavior,
         },
         "scheduler": {
             "max_num_seqs": global_settings.scheduler.max_num_seqs,
@@ -1849,6 +1875,18 @@ async def update_global_settings(
     if request.watermark_red is not None:
         global_settings.memory.watermark_red = request.watermark_red
         pressure_settings_changed = True
+    if request.system_memory_monitoring is not None:
+        global_settings.memory.system_memory_monitoring = request.system_memory_monitoring
+        pressure_settings_changed = True
+    if request.system_watermark_yellow is not None:
+        global_settings.memory.system_watermark_yellow = request.system_watermark_yellow
+        pressure_settings_changed = True
+    if request.system_watermark_red is not None:
+        global_settings.memory.system_watermark_red = request.system_watermark_red
+        pressure_settings_changed = True
+    if request.system_watermark_critical is not None:
+        global_settings.memory.system_watermark_critical = request.system_watermark_critical
+        pressure_settings_changed = True
 
     if pressure_settings_changed:
         try:
@@ -1857,6 +1895,31 @@ async def update_global_settings(
             raise HTTPException(status_code=400, detail=str(e))
         _apply_pressure_settings_runtime(global_settings.memory)
         runtime_applied.append("pressure_management")
+
+    # Apply model lifecycle settings (Live - immediately applied)
+    if request.global_ttl_seconds is not None:
+        if request.global_ttl_seconds < 0:
+            raise HTTPException(
+                status_code=400, detail="global_ttl_seconds must be >= 0"
+            )
+        global_settings.memory.global_ttl_seconds = request.global_ttl_seconds
+        runtime_applied.append("global_ttl_seconds")
+    if request.model_scan_interval_seconds is not None:
+        if request.model_scan_interval_seconds != 0 and request.model_scan_interval_seconds < 10:
+            raise HTTPException(
+                status_code=400,
+                detail="model_scan_interval_seconds must be 0 (disabled) or >= 10",
+            )
+        global_settings.memory.model_scan_interval_seconds = request.model_scan_interval_seconds
+        runtime_applied.append("model_scan_interval_seconds")
+    if request.jit_loading_behavior is not None:
+        if request.jit_loading_behavior not in ("block", "reject"):
+            raise HTTPException(
+                status_code=400,
+                detail="jit_loading_behavior must be 'block' or 'reject'",
+            )
+        global_settings.memory.jit_loading_behavior = request.jit_loading_behavior
+        runtime_applied.append("jit_loading_behavior")
 
     # Apply scheduler settings (restart required)
     if request.max_num_seqs is not None:
@@ -2411,6 +2474,9 @@ async def get_server_stats(
     # Build active_models data for the dashboard card.
     active_models_data = _build_active_models_data()
 
+    # Build VRAM breakdown (model weights, hot KV cache, overhead)
+    memory_breakdown = _build_memory_breakdown(engine_pool, memory_pressure)
+
     return {
         **snapshot,
         "host": host,
@@ -2429,13 +2495,60 @@ async def get_server_stats(
         ),
         "engines": _get_engine_info(),
         "memory_pressure": memory_pressure,
+        "memory_breakdown": memory_breakdown,
         "prefetch_stats": prefetch_stats,
         "active_models": active_models_data,
     }
 
 
+def _build_memory_breakdown(engine_pool, memory_pressure) -> dict | None:
+    """Build VRAM breakdown: model weights, hot KV cache, overhead."""
+    if engine_pool is None or memory_pressure is None:
+        return None
+
+    total_active = memory_pressure.get("current_bytes", 0)
+    if total_active == 0:
+        return None
+
+    model_weights = engine_pool.current_model_memory
+
+    # Aggregate hot cache bytes across all loaded engines
+    # Uses the correct 3-level access chain (entry.engine._engine.engine.scheduler)
+    hot_cache_bytes = 0
+    hot_cache_max = 0
+    for entry in engine_pool._entries.values():
+        if entry.engine is None:
+            continue
+        async_core = getattr(entry.engine, "_engine", None)
+        if async_core is None:
+            continue
+        core = getattr(async_core, "engine", None)
+        if core is None:
+            continue
+        scheduler = getattr(core, "scheduler", None)
+        if scheduler is None:
+            continue
+        ssd_mgr = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd_mgr is None:
+            continue
+        hot_cache_bytes += ssd_mgr._hot_cache_total_bytes
+        hot_cache_max += ssd_mgr._hot_cache_max_bytes
+
+    overhead = max(0, total_active - model_weights - hot_cache_bytes)
+
+    return {
+        "model_weights": model_weights,
+        "hot_cache": hot_cache_bytes,
+        "hot_cache_max": hot_cache_max,
+        "overhead": overhead,
+        "total": total_active,
+    }
+
+
 def _build_active_models_data() -> dict:
     """Build active models status for the dashboard Active Models card."""
+    import time as _time
+
     from ..model_discovery import format_size
     from ..prefill_progress import get_prefill_tracker
 
@@ -2449,11 +2562,16 @@ def _build_active_models_data() -> dict:
             "total_waiting_requests": 0,
         }
 
+    settings_manager = _get_settings_manager()
+    global_settings = _get_global_settings()
+    global_ttl = global_settings.memory.global_ttl_seconds if global_settings else 0
+
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
     models = []
     total_active = 0
     total_waiting = 0
+    now = _time.time()
 
     for model_info in status.get("models", []):
         if not model_info.get("loaded") and not model_info.get("is_loading"):
@@ -2478,6 +2596,22 @@ def _build_active_models_data() -> dict:
 
         prefilling = tracker.get_model_progress(model_id)
 
+        # Compute idle time and TTL countdown
+        last_access = model_info.get("last_access")
+        idle_seconds = None
+        evicts_in_seconds = None
+        if last_access and model_info.get("loaded") and not model_info.get("is_loading"):
+            idle_seconds = max(0, int(now - last_access))
+            if not model_info.get("pinned", False):
+                per_model_ttl = None
+                if settings_manager:
+                    ms = settings_manager.get_settings(model_id)
+                    if ms.ttl_seconds is not None:
+                        per_model_ttl = ms.ttl_seconds
+                effective_ttl = per_model_ttl if per_model_ttl is not None else global_ttl
+                if effective_ttl > 0:
+                    evicts_in_seconds = max(0, effective_ttl - idle_seconds)
+
         models.append({
             "id": model_id,
             "estimated_size": model_info.get("estimated_size", 0),
@@ -2489,6 +2623,8 @@ def _build_active_models_data() -> dict:
             "active_requests": active_requests,
             "waiting_requests": waiting_requests,
             "prefilling": prefilling,
+            "idle_seconds": idle_seconds,
+            "evicts_in_seconds": evicts_in_seconds,
         })
 
         total_active += active_requests

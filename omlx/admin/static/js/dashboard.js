@@ -25,7 +25,7 @@
                 base_path: '',
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
-                memory: { max_process_memory: 'auto', pressure_management_enabled: true, target_free_memory: 'disabled', watermark_yellow: 0.75, watermark_red: 0.90 },
+                memory: { max_process_memory: 'auto', pressure_management_enabled: true, target_free_memory: 'disabled', watermark_yellow: 0.75, watermark_red: 0.90, global_ttl_seconds: 180, model_scan_interval_seconds: 60, jit_loading_behavior: 'block' },
                 scheduler: { max_num_seqs: 8, completion_batch_size: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
@@ -118,6 +118,7 @@
                     total_active_requests: 0,
                     total_waiting_requests: 0,
                 },
+                memory_breakdown: null,
             },
             alltimeStats: {
                 total_prompt_tokens: 0,
@@ -542,6 +543,9 @@
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
+                            global_ttl_seconds: this.globalSettings.memory.global_ttl_seconds,
+                            model_scan_interval_seconds: this.globalSettings.memory.model_scan_interval_seconds,
+                            jit_loading_behavior: this.globalSettings.memory.jit_loading_behavior,
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
                         }),
@@ -1130,6 +1134,39 @@
                 const am = this.stats.active_models;
                 if (!am || !am.model_memory_max) return 0;
                 return Math.min(100, (am.model_memory_used / am.model_memory_max) * 100);
+            },
+
+            modelLifecycleStatus(model) {
+                // Returns 'loading', 'loaded', or 'discovered'
+                if (model.is_loading) return 'loading';
+                if (model.loaded) return 'loaded';
+                return 'discovered';
+            },
+
+            modelIdleSeconds(model) {
+                // Returns idle seconds for a loaded model with last_access, or null
+                if (!model.loaded || !model.last_access) return null;
+                return Math.max(0, Math.floor(Date.now() / 1000 - model.last_access));
+            },
+
+            modelEvictsInSeconds(model) {
+                // Returns seconds until TTL eviction, or null if N/A
+                if (!model.loaded || !model.last_access) return null;
+                const globalTtl = this.globalSettings.memory.global_ttl_seconds || 0;
+                const perModelTtl = model.settings && model.settings.ttl_seconds != null ? model.settings.ttl_seconds : null;
+                const effectiveTtl = perModelTtl !== null ? perModelTtl : globalTtl;
+                if (effectiveTtl <= 0 || model.pinned) return null;
+                const idleSec = this.modelIdleSeconds(model);
+                if (idleSec === null) return null;
+                return Math.max(0, effectiveTtl - idleSec);
+            },
+
+            formatDuration(seconds) {
+                if (seconds === null || seconds === undefined) return '';
+                if (seconds < 60) return seconds + 's';
+                const m = Math.floor(seconds / 60);
+                const s = seconds % 60;
+                return s > 0 ? m + 'm ' + s + 's' : m + 'm';
             },
 
             pressureZoneColor(zone) {

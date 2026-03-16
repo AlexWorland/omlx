@@ -697,6 +697,46 @@
                             </div>
                         </div>
 
+                        <!-- Model Lifecycle Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="timer" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.lifecycle.section_label') }}</span>
+                                </div>
+                                <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-green-50 text-green-600 border border-green-200">{{ t('settings.resource.live_badge') }}</span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.lifecycle.global_ttl_seconds') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.lifecycle.global_ttl_seconds_help') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.memory.global_ttl_seconds" min="0"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.lifecycle.model_scan_interval_seconds') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.lifecycle.model_scan_interval_seconds_help') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.memory.model_scan_interval_seconds" min="0"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.lifecycle.jit_loading_behavior') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.lifecycle.jit_loading_behavior_help') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.memory.jit_loading_behavior"
+                                            class="w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="block">{{ t('settings.lifecycle.jit_block') }}</option>
+                                        <option value="reject">{{ t('settings.lifecycle.jit_reject') }}</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Sampling Defaults Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -1027,7 +1067,7 @@
                                                     <span x-text="hover ? window.t('settings.models.table.status_unload') : window.t('settings.models.table.status_loaded')"></span>
                                                 </button>
                                             </template>
-                                            <!-- Ready state -->
+                                            <!-- Discovered state (unloaded, available for JIT load) -->
                                             <template x-if="!model.is_loading && !model.loaded">
                                                 <button @click="loadModel(model.id)"
                                                         :class="hover
@@ -1035,7 +1075,7 @@
                                                             : 'bg-white text-neutral-500 border-neutral-200'"
                                                         class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 border transition-all">
                                                     <span :class="hover ? 'bg-green-500' : 'bg-neutral-400'" class="w-1.5 h-1.5 rounded-full"></span>
-                                                    <span x-text="hover ? window.t('settings.models.table.status_load') : window.t('settings.models.table.status_ready')"></span>
+                                                    <span x-text="hover ? window.t('settings.models.table.status_load') : window.t('settings.lifecycle.model_status_discovered')"></span>
                                                 </button>
                                             </template>
                                         </div>
@@ -1082,6 +1122,22 @@
                                             >
                                                 <i data-lucide="settings" class="w-4 h-4"></i>
                                             </button>
+                                        </div>
+                                    </div>
+
+                                    <!-- Lifecycle Row (idle time + TTL countdown) — only for loaded models with last_access -->
+                                    <div x-show="model.loaded && model.last_access"
+                                         class="px-6 pb-3 -mt-2">
+                                        <div class="ml-11 flex items-center gap-3">
+                                            <span class="text-[10px] text-neutral-400"
+                                                  x-text="window.t('settings.lifecycle.idle_for') + ' ' + formatDuration(Math.max(0, Math.floor(Date.now() / 1000 - model.last_access)))"></span>
+                                            <template x-if="modelEvictsInSeconds(model) != null">
+                                                <span class="text-[10px] text-amber-500 font-medium"
+                                                      x-text="window.t('settings.lifecycle.evicts_in') + ' ' + formatDuration(modelEvictsInSeconds(model))"></span>
+                                            </template>
+                                            <template x-if="!model.pinned && modelEvictsInSeconds(model) === null && (globalSettings.memory.global_ttl_seconds > 0 || (model.settings && model.settings.ttl_seconds > 0))">
+                                                <span class="text-[10px] text-neutral-300">{{ t('settings.lifecycle.ttl_disabled') }}</span>
+                                            </template>
                                         </div>
                                     </div>
 
