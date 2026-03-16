@@ -408,3 +408,67 @@ class TestJITLoading:
             assert all(isinstance(r, Exception) for r in results)
 
         asyncio.run(_run())
+
+
+# =========================================================================
+# Integration Tests
+# =========================================================================
+
+
+class TestJITIntegration:
+    """Integration tests for the full JIT lifecycle."""
+
+    def test_evict_and_reload_cycle(self):
+        """Model is evicted by TTL, then reloaded on next request."""
+
+        async def _run():
+            pool = EnginePool(max_model_memory=None, scheduler_config=MagicMock())
+            mock_engine = MagicMock()
+            entry = EngineEntry(
+                model_id="m1",
+                model_path="/tmp/m1",
+                model_type="llm",
+                engine_type="batched",
+                estimated_size=1000,
+            )
+            pool._entries = {"m1": entry}
+
+            # Phase 1: Load the model via JIT
+            with patch.object(pool, "_load_engine") as mock_load:
+                async def fake_load(mid):
+                    pool._entries[mid].engine = mock_engine
+                    pool._entries[mid].last_access = time.time()
+                    pool._entries[mid].is_loading = False
+                    pool._entries[mid].loading_event.set()
+                mock_load.side_effect = fake_load
+                engine = await pool.get_engine("m1")
+                assert engine is mock_engine
+
+            # Phase 2: Simulate idle time and TTL eviction
+            pool._entries["m1"].last_access = time.time() - 200
+
+            async def mock_unload(mid):
+                pool._entries[mid].engine = None
+                pool._entries[mid].is_loading = False
+
+            pool._unload_engine_unlocked = mock_unload
+
+            settings_mgr = _make_mock_settings_manager()
+            expired = await pool.check_ttl_expirations(settings_mgr, global_ttl_seconds=180)
+            assert "m1" in expired
+            assert pool._entries["m1"].engine is None  # Evicted to Discovered state
+            assert "m1" in pool._entries  # Still in entries
+
+            # Phase 3: Reload on next request (JIT again)
+            new_engine = MagicMock()
+            with patch.object(pool, "_load_engine") as mock_load:
+                async def fake_reload(mid):
+                    pool._entries[mid].engine = new_engine
+                    pool._entries[mid].last_access = time.time()
+                    pool._entries[mid].is_loading = False
+                    pool._entries[mid].loading_event.set()
+                mock_load.side_effect = fake_reload
+                engine = await pool.get_engine("m1")
+                assert engine is new_engine
+
+        asyncio.run(_run())
