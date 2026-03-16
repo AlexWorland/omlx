@@ -1294,6 +1294,25 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "last_access": model_info.get("last_access"),
         }
 
+        # Lifecycle fields
+        if model_info.get("loaded"):
+            idle_seconds = int(time.time() - model_info.get("last_access", 0)) if model_info.get("last_access") else 0
+            per_model_ttl = settings.ttl_seconds if settings else None
+            if per_model_ttl is not None:
+                effective_ttl = per_model_ttl
+            else:
+                effective_ttl = 0
+                if _get_server_state() and _get_server_state().global_settings:
+                    effective_ttl = _get_server_state().global_settings.memory.global_ttl_seconds
+            model_data["status"] = "loaded"
+            model_data["idle_seconds"] = idle_seconds
+            model_data["ttl_seconds"] = effective_ttl
+            model_data["evicts_in_seconds"] = max(0, effective_ttl - idle_seconds) if effective_ttl > 0 else None
+        elif model_info.get("is_loading"):
+            model_data["status"] = "loading"
+        else:
+            model_data["status"] = "discovered"
+
         # Add settings if available
         if settings:
             model_data["settings"] = {
@@ -1361,7 +1380,10 @@ async def load_model(
     if entry.engine is not None:
         return {"status": "ok", "model_id": model_id, "message": f"Already loaded: {model_id}"}
     if entry.is_loading:
-        raise HTTPException(status_code=409, detail=f"Model is already loading: {model_id}")
+        await entry.loading_event.wait()
+        if entry.engine is not None:
+            return {"status": "ok", "model_id": model_id, "message": f"Loaded: {model_id}"}
+        raise HTTPException(status_code=500, detail=f"Model failed to load: {model_id}")
 
     try:
         await engine_pool.get_engine(model_id)
