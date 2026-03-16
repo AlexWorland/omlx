@@ -43,6 +43,13 @@ from .scheduler import SchedulerConfig
 logger = logging.getLogger(__name__)
 
 
+def _make_set_event() -> asyncio.Event:
+    """Create an asyncio.Event that starts in the set state."""
+    event = asyncio.Event()
+    event.set()
+    return event
+
+
 @dataclass
 class EngineEntry:
     """Per-model state in the engine pool."""
@@ -58,6 +65,7 @@ class EngineEntry:
     is_loading: bool = False  # Prevent concurrent loads
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
+    loading_event: asyncio.Event = field(default_factory=_make_set_event)
 
 
 class EnginePool:
@@ -347,6 +355,9 @@ class EnginePool:
                                 f"{format_size(enforcer.max_bytes)})"
                             )
                             await self._unload_engine(victim)
+                            gc.collect()
+                            loop = asyncio.get_running_loop()
+                            await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
                             continue
                         # No more victims — cannot fit
                         raise InsufficientMemoryError(
@@ -378,16 +389,21 @@ class EnginePool:
         """
         if self._max_model_memory is None:
             return  # No model memory limit
-        while self._current_model_memory + required > self._max_model_memory:
+        while True:
+            software_estimate = self._current_model_memory
+            actual_metal = mx.get_active_memory()
+            current_usage = max(software_estimate, actual_metal)
+            if current_usage + required <= self._max_model_memory:
+                break
             victim = self._find_lru_victim()
             if not victim:
                 raise InsufficientMemoryError(
                     required=required,
-                    current=self._current_model_memory,
+                    current=current_usage,
                     message=(
                         f"Cannot free enough memory. "
                         f"Need {format_size(required)}, "
-                        f"current usage {format_size(self._current_model_memory)}, "
+                        f"current usage {format_size(current_usage)}, "
                         f"all loaded models are pinned."
                     ),
                 )
@@ -546,6 +562,21 @@ class EnginePool:
                     f"process memory limit exceeded"
                 )
 
+            # Force Metal allocation commit so get_active_memory() is accurate
+            mx.eval(mx.zeros(1))
+
+            # Post-load memory check
+            if self._process_memory_enforcer is not None:
+                actual_memory = mx.get_active_memory()
+                max_bytes = self._process_memory_enforcer._max_bytes
+                if actual_memory > max_bytes:
+                    logger.warning(
+                        f"Post-load memory exceeds limit: {actual_memory / (1024**3):.1f}GB / "
+                        f"{max_bytes / (1024**3):.1f}GB — model load caused overcommit"
+                    )
+                    # Don't immediately unload — let the enforcer handle it on next poll
+                    # This avoids a load/unload thrashing loop
+
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
@@ -553,6 +584,12 @@ class EnginePool:
             # Propagate memory limit to new engine's scheduler
             if self._process_memory_enforcer is not None:
                 self._process_memory_enforcer._propagate_memory_limit()
+
+            # Propagate _prefill_paused state to new engine's scheduler
+            if self._process_memory_enforcer is not None:
+                scheduler = getattr(engine, "scheduler", None)
+                if scheduler is not None:
+                    scheduler._prefill_paused = self._process_memory_enforcer._prefill_paused
 
             logger.info(
                 f"Loaded model: {model_id} "
@@ -622,7 +659,7 @@ class EnginePool:
         }
 
     async def check_ttl_expirations(
-        self, settings_manager: ModelSettingsManager
+        self, settings_manager: ModelSettingsManager, global_ttl_seconds: int = 0
     ) -> list[str]:
         """Check and unload models that have exceeded their TTL.
 
@@ -644,11 +681,18 @@ class EnginePool:
                     continue
 
                 settings = settings_manager.get_settings(model_id)
-                if settings.ttl_seconds is None:
+                # Determine effective TTL: per-model overrides global
+                if settings.ttl_seconds is not None:
+                    effective_ttl = settings.ttl_seconds
+                else:
+                    effective_ttl = global_ttl_seconds
+
+                # TTL of 0 means disabled (never auto-evict)
+                if effective_ttl <= 0:
                     continue
 
                 idle_time = now - entry.last_access
-                if idle_time < settings.ttl_seconds:
+                if idle_time < effective_ttl:
                     continue
 
                 # Check if model has active requests
@@ -668,7 +712,7 @@ class EnginePool:
 
                 logger.info(
                     f"TTL expired for model '{model_id}' "
-                    f"(idle {idle_time:.0f}s > ttl {settings.ttl_seconds}s)"
+                    f"(idle {idle_time:.0f}s > ttl {effective_ttl}s)"
                 )
                 await self._unload_engine(model_id)
                 expired.append(model_id)
