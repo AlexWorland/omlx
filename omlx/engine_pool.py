@@ -28,6 +28,9 @@ import mlx.core as mx
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
+from .engine.stt import STTEngine
+from .engine.sts import STSEngine
+from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
     EnginePoolError,
@@ -49,11 +52,11 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
-    engine: BaseEngine | EmbeddingEngine | RerankerEngine | None = None  # Loaded engine instance
+    engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
     is_pinned: bool = False  # Never evict if True
@@ -91,6 +94,7 @@ class EnginePool:
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
+        self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
 
     @property
     def max_model_memory(self) -> int | None:
@@ -185,6 +189,9 @@ class EnginePool:
         "vlm": "vlm",
         "embedding": "embedding",
         "reranker": "reranker",
+        "audio_stt": "audio_stt",
+        "audio_tts": "audio_tts",
+        "audio_sts": "audio_sts",
     }
 
     def apply_settings_overrides(
@@ -232,16 +239,32 @@ class EnginePool:
         entry.is_pinned = pinned
         return True
 
+    def _case_insensitive_entry_match(self, name: str) -> str | None:
+        """Find a model entry matching *name* case-insensitively.
+
+        Returns the actual model_id if found, None otherwise.
+        """
+        lower = name.lower()
+        for mid in self._entries:
+            if mid.lower() == lower:
+                return mid
+        return None
+
     def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
-        Tries exact match in _entries first, then scans model settings
-        for alias match. If those fail and input contains a provider prefix
-        (e.g. "omlx/my-model"), strips the prefix and retries.
-        Returns the original string if no match found.
+        Tries exact match in _entries first, then case-insensitive match,
+        then scans model settings for alias match. If those fail and input
+        contains a provider prefix (e.g. "omlx/my-model"), strips the prefix
+        and retries. Returns the original string if no match found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
+
+        # Case-insensitive fallback
+        ci_match = self._case_insensitive_entry_match(model_id_or_alias)
+        if ci_match is not None:
+            return ci_match
 
         all_settings = None
         if settings_manager is not None:
@@ -255,6 +278,9 @@ class EnginePool:
             stripped = model_id_or_alias.split("/", 1)[1]
             if stripped in self._entries:
                 return stripped
+            ci_match = self._case_insensitive_entry_match(stripped)
+            if ci_match is not None:
+                return ci_match
             if all_settings is not None:
                 for mid, ms in all_settings.items():
                     if ms.model_alias and ms.model_alias == stripped:
@@ -262,7 +288,9 @@ class EnginePool:
 
         return model_id_or_alias
 
-    async def get_engine(self, model_id: str) -> BaseEngine | EmbeddingEngine | RerankerEngine:
+    async def get_engine(
+        self, model_id: str, force_lm: bool = False,
+    ) -> BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine:
         """
         Get or load engine for the specified model.
 
@@ -275,6 +303,8 @@ class EnginePool:
 
         Args:
             model_id: The model ID to get engine for
+            force_lm: Force loading as LM (BatchedEngine) even for VLM models.
+                Useful for text-only tasks like accuracy benchmarks.
 
         Returns:
             The loaded engine (BaseEngine for LLM, EmbeddingEngine for embeddings)
@@ -292,8 +322,16 @@ class EnginePool:
 
             # Already loaded - just update access time
             if entry.engine is not None:
-                entry.last_access = time.time()
-                return entry.engine
+                # If force_lm requested but current engine is VLM, unload and reload
+                if force_lm and isinstance(entry.engine, VLMBatchedEngine):
+                    logger.info(
+                        f"Unloading VLM engine for {model_id} "
+                        f"(force_lm=True, reloading as LM)"
+                    )
+                    await self._unload_engine(model_id)
+                else:
+                    entry.last_access = time.time()
+                    return entry.engine
 
             # Check if model is too large for memory limit
             if (
@@ -309,8 +347,12 @@ class EnginePool:
             # Always try to evict with headroom first. If all evictable models
             # are gone and the model still fits without headroom, allow it.
             # Skip entirely when model memory limit is disabled (None).
+            # Audio engines (STT/TTS) don't use KV cache, so headroom is 0.
             if self._max_model_memory is not None:
-                kv_headroom = int(entry.estimated_size * 0.25)
+                if entry.engine_type in ("audio_stt", "audio_tts", "audio_sts"):
+                    kv_headroom = 0
+                else:
+                    kv_headroom = int(entry.estimated_size * 0.25)
                 required_with_headroom = entry.estimated_size + kv_headroom
                 try:
                     await self._ensure_memory_available(required_with_headroom)
@@ -362,7 +404,7 @@ class EnginePool:
                         )
 
             # Now load the model
-            await self._load_engine(model_id)
+            await self._load_engine(model_id, force_lm=force_lm)
 
             return self._entries[model_id].engine
 
@@ -440,21 +482,26 @@ class EnginePool:
         # Force garbage collection to release memory.
         # Run mx.clear_cache on the global MLX executor to avoid concurrent
         # Metal operations with running engines. See issue #85.
+        # Synchronize before clearing to prevent releasing Metal buffers
+        # still referenced by in-flight command buffers. See issue #300.
         gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+        await loop.run_in_executor(
+            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+        )
 
         logger.info(
             f"Unloaded model: {model_id}, "
             f"memory usage: {format_size(self._current_model_memory)}"
         )
 
-    async def _load_engine(self, model_id: str) -> None:
+    async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
         """
         Load an engine for the specified model.
 
         Args:
             model_id: The model ID to load
+            force_lm: Force loading as BatchedEngine even for VLM models.
 
         Raises:
             ModelLoadingError: If model is already being loaded
@@ -466,7 +513,12 @@ class EnginePool:
         entry.is_loading = True
         entry.abort_loading = False
         try:
-            logger.info(f"Loading model: {model_id}")
+            effective_type = entry.engine_type
+            if force_lm and effective_type == "vlm":
+                effective_type = "batched"
+                logger.info(f"Loading model as LM (force_lm=True): {model_id}")
+            else:
+                logger.info(f"Loading model: {model_id}")
 
             # Retrieve per-model settings for post-load transforms
             model_settings = None
@@ -474,17 +526,27 @@ class EnginePool:
                 model_settings = self._settings_manager.get_settings(model_id)
 
             # Create engine based on engine type
-            if entry.engine_type == "embedding":
+            if effective_type == "embedding":
                 # EmbeddingEngine for embedding models
                 engine = EmbeddingEngine(model_name=entry.model_path)
-            elif entry.engine_type == "reranker":
+            elif effective_type == "reranker":
                 # RerankerEngine for reranker models
                 engine = RerankerEngine(model_name=entry.model_path)
-            elif entry.engine_type == "vlm":
+            elif effective_type == "vlm":
                 # VLMBatchedEngine for vision-language models
                 engine = VLMBatchedEngine(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,
+                    model_settings=model_settings,
+                )
+            elif entry.engine_type == "audio_stt":
+                engine = STTEngine(model_name=entry.model_path)
+            elif entry.engine_type == "audio_tts":
+                engine = TTSEngine(model_name=entry.model_path)
+            elif entry.engine_type == "audio_sts":
+                engine = STSEngine(
+                    model_name=entry.model_path,
+                    config_model_type=entry.config_model_type,
                 )
             else:
                 # BatchedEngine with continuous batching (default)
@@ -509,7 +571,10 @@ class EnginePool:
                         pass
                     gc.collect()
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+                    await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
 
                     engine = BatchedEngine(
                         model_name=entry.model_path,
@@ -540,7 +605,10 @@ class EnginePool:
                     )
                 gc.collect()
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
                 raise ModelLoadingError(
                     f"Model {model_id} load aborted: "
                     f"process memory limit exceeded"
@@ -553,6 +621,18 @@ class EnginePool:
             # Propagate memory limit to new engine's scheduler
             if self._process_memory_enforcer is not None:
                 self._process_memory_enforcer._propagate_memory_limit()
+
+            # Release intermediate Metal buffers from model loading.
+            # mlx_lm.load() creates large temporaries (weight transforms,
+            # quantization intermediates) that stay in the Metal buffer pool
+            # because mx.set_cache_limit(total_mem) prevents automatic release.
+            # Without this, memory stays at ~2x model size until the first
+            # inference request triggers a clear. (#429)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                lambda: (mx.synchronize(), mx.clear_cache()),
+            )
 
             logger.info(
                 f"Loaded model: {model_id} "
@@ -608,6 +688,7 @@ class EnginePool:
             "models": [
                 {
                     "id": mid,
+                    "model_path": e.model_path,
                     "loaded": e.engine is not None,
                     "is_loading": e.is_loading,
                     "estimated_size": e.estimated_size,
@@ -628,6 +709,7 @@ class EnginePool:
 
         Pinned models are skipped (TTL is ignored for pinned models).
         Models with active requests are skipped and their last_access is refreshed.
+        Suppressed during benchmark runs via _suppress_ttl flag.
 
         Args:
             settings_manager: The settings manager to read TTL values from.
@@ -635,6 +717,9 @@ class EnginePool:
         Returns:
             List of model IDs that were unloaded.
         """
+        if self._suppress_ttl:
+            return []
+
         now = time.time()
         expired: list[str] = []
 

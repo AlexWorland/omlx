@@ -98,7 +98,7 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Hash table for quick prefix lookup
         # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks)
-        self._prefix_index: Dict[bytes, Tuple[int, List[int], int]] = {}
+        self._prefix_index: Dict[bytes, Tuple[int, Tuple[int, ...], int]] = {}
 
         # Request to block table mapping
         self._request_tables: Dict[str, BlockCacheEntry] = {}
@@ -111,6 +111,10 @@ class BlockAwarePrefixCache(CacheManager):
         self._hits = 0
         self._misses = 0
         self._tokens_saved = 0
+        self._partial_block_skips = 0
+        self._partial_tokens_skipped = 0
+        self._last_partial_tokens_skipped = 0
+        self._last_tokens_to_next_block = 0
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
@@ -357,7 +361,11 @@ class BlockAwarePrefixCache(CacheManager):
         elif is_tensor_data:
             # Try to extract type info from cache_data itself
             layer_cache_types = [
-                layer_state.get('cache_type', 'KVCache')
+                # Prefer class_name for TurboQuant (cache_type maps to 'KVCache'),
+                # fall back to cache_type for all standard mlx-lm types.
+                layer_state.get('class_name', layer_state.get('cache_type', 'KVCache'))
+                if layer_state.get('class_name', '') in ('TurboQuantKVCache', 'BatchTurboQuantKVCache')
+                else layer_state.get('cache_type', 'KVCache')
                 for layer_state in cache_data
             ]
             layer_meta_states = [
@@ -376,6 +384,8 @@ class BlockAwarePrefixCache(CacheManager):
 
         if not new_tokens:
             # All tokens already cached
+            self._last_partial_tokens_skipped = 0
+            self._last_tokens_to_next_block = 0
             return block_table
 
         # Allocate only full blocks (skip partial trailing block).
@@ -385,6 +395,25 @@ class BlockAwarePrefixCache(CacheManager):
         # the last full block, which is critical for non-sliceable caches
         # (ArraysCache/RotatingKVCache) that use last-block-only storage.
         num_new_blocks = len(new_tokens) // self.block_size
+        trailing_partial_tokens = len(new_tokens) % self.block_size
+        self._last_partial_tokens_skipped = trailing_partial_tokens
+        self._last_tokens_to_next_block = (
+            self.block_size - trailing_partial_tokens
+            if trailing_partial_tokens > 0
+            else 0
+        )
+        if trailing_partial_tokens > 0:
+            self._partial_block_skips += 1
+            self._partial_tokens_skipped += trailing_partial_tokens
+            logger.debug(
+                "Skipping trailing partial block for %s: %s token(s) not persisted "
+                "(block_size=%s, needs +%s token(s) to fill next block)",
+                request_id,
+                trailing_partial_tokens,
+                self.block_size,
+                self._last_tokens_to_next_block,
+            )
+
         blocks_saved_to_ssd = 0
 
         for i in range(num_new_blocks):
@@ -581,7 +610,16 @@ class BlockAwarePrefixCache(CacheManager):
                 if cache_type in non_sliceable_types or class_name in non_sliceable_types:
                     continue
 
-                keys, _ = layer_state['state']
+                state = layer_state['state']
+                keys = state[0] if isinstance(state, (list, tuple)) else state
+                # TurboQuant: keys = (k_norms, k_packed) tuple
+                if isinstance(keys, tuple) and len(keys) == 2 and hasattr(keys[0], 'shape'):
+                    k_norms = keys[0]
+                    seq_len = k_norms.shape[2] if len(k_norms.shape) >= 3 else k_norms.shape[1]
+                    logger.debug(
+                        f"Found TurboQuantKVCache at layer {layer_idx} with seq_len={seq_len}"
+                    )
+                    return seq_len
                 if not hasattr(keys, 'shape'):
                     continue
 
@@ -698,7 +736,47 @@ class BlockAwarePrefixCache(CacheManager):
 
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
 
-                if handler.supports_block_slicing:
+                if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
+                    # TurboQuant: state = ((k_norms, k_packed), (v_norms, v_packed))
+                    state = layer_state['state']
+                    if not isinstance(state, (list, tuple)) or len(state) < 2:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    k_state, v_state = state
+                    if not isinstance(k_state, (list, tuple)) or len(k_state) < 2:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    k_norms, k_packed = k_state
+                    v_norms, v_packed = v_state
+                    # Slice along axis 2 (sequence dimension)
+                    # k_norms: (B, H, T), k_packed: (B, H, T, pw)
+                    seq_len = k_norms.shape[2] if len(k_norms.shape) >= 3 else k_norms.shape[1]
+                    actual_end = min(end_idx, seq_len)
+                    if start_idx >= actual_end:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    if len(k_norms.shape) >= 3:
+                        kn_s = k_norms[:, :, start_idx:actual_end]
+                        kp_s = k_packed[:, :, start_idx:actual_end, :]
+                        vn_s = v_norms[:, :, start_idx:actual_end]
+                        vp_s = v_packed[:, :, start_idx:actual_end, :]
+                    else:
+                        kn_s = k_norms[:, start_idx:actual_end]
+                        kp_s = k_packed[:, start_idx:actual_end, :]
+                        vn_s = v_norms[:, start_idx:actual_end]
+                        vp_s = v_packed[:, start_idx:actual_end, :]
+                    # Store with extra metadata for reconstruction
+                    bits = layer_state.get('meta_state', (0,))
+                    block_slices.append((
+                        '__turboquant__',
+                        (
+                            self._clone_tensor(kn_s),
+                            self._clone_tensor(kp_s),
+                            self._clone_tensor(vn_s),
+                            self._clone_tensor(vp_s),
+                        ),
+                    ))
+                elif handler.supports_block_slicing:
                     # Standard 4D KV cache slicing
                     state = layer_state['state']
                     if not isinstance(state, (list, tuple)) or len(state) < 2:
@@ -1258,6 +1336,8 @@ class BlockAwarePrefixCache(CacheManager):
                     # Free ref_counts for all blocks before returning
                     for bid in block_table.block_ids:
                         self.paged_cache.free_block(bid)
+                    block_table.block_ids.clear()
+                    block_table.num_tokens = 0
                     return None  # No valid blocks at all
 
                 # Free ref_counts for blocks we are about to drop
@@ -1430,6 +1510,60 @@ class BlockAwarePrefixCache(CacheManager):
                     reconstructed_caches.append(cache)
                     continue
 
+                # === TurboQuantKVCache: concat 4 tensors, reconstruct directly ===
+                if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
+                    kn_list, kp_list, vn_list, vp_list = [], [], [], []
+                    for block_data in all_block_data:
+                        if layer_idx >= len(block_data):
+                            continue
+                        bd = block_data[layer_idx]
+                        # From SSD: ((kn, kp), (vn, vp)) nested tuple
+                        if isinstance(bd, tuple) and len(bd) == 2:
+                            if isinstance(bd[0], str) and bd[0] == '__turboquant__':
+                                kn, kp, vn, vp = bd[1]
+                            elif isinstance(bd[0], tuple):
+                                (kn, kp), (vn, vp) = bd
+                            else:
+                                continue
+                            kn_list.append(kn)
+                            kp_list.append(kp)
+                            vn_list.append(vn)
+                            vp_list.append(vp)
+                    if not kn_list:
+                        logger.debug(f"TQ layer {layer_idx}: no block data")
+                        return None
+                    cat_kn = mx.concatenate(kn_list, axis=2) if len(kn_list[0].shape) >= 3 else mx.concatenate(kn_list, axis=1)
+                    cat_kp = mx.concatenate(kp_list, axis=2) if len(kp_list[0].shape) >= 4 else mx.concatenate(kp_list, axis=1)
+                    cat_vn = mx.concatenate(vn_list, axis=2) if len(vn_list[0].shape) >= 3 else mx.concatenate(vn_list, axis=1)
+                    cat_vp = mx.concatenate(vp_list, axis=2) if len(vp_list[0].shape) >= 4 else mx.concatenate(vp_list, axis=1)
+                    try:
+                        from ..turboquant_kv import TurboQuantKVCache
+                        from mlx_lm.models.cache import KVCache
+                        # Get bits from meta_state: (offset, bits, seed)
+                        tq_bits = 4
+                        tq_seed = 0
+                        ms = None
+                        if first_block_meta_states and layer_idx < len(first_block_meta_states):
+                            ms = first_block_meta_states[layer_idx]
+                        if isinstance(ms, (list, tuple)) and len(ms) >= 3:
+                            tq_bits = int(ms[1])
+                            tq_seed = int(ms[2])
+                        # Dequantize back to fp16 KVCache for merge compatibility.
+                        # TQ will be re-applied at decode start (lazy quantization).
+                        tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
+                        tq.state = ((cat_kn, cat_kp), (cat_vn, cat_vp))
+                        tq._quantized = True
+                        keys, values = tq.dequantize()
+                        cache = KVCache()
+                        cache.keys = keys
+                        cache.values = values
+                        cache.offset = keys.shape[2]
+                        reconstructed_caches.append(cache)
+                    except Exception as e:
+                        logger.error(f"TQ layer {layer_idx}: reconstruction failed: {e}")
+                        return None
+                    continue
+
                 # Collect layer data from all blocks
                 layer_states = []
                 for block_data in all_block_data:
@@ -1543,6 +1677,31 @@ class BlockAwarePrefixCache(CacheManager):
                     f"layers, expected {num_layers}"
                 )
                 return None
+
+            # Verify KVCache offset consistency across KVCache-typed layers.
+            # All KVCache layers must have the same offset (they process
+            # the same tokens). A mismatch causes broadcast_shapes errors
+            # when the model creates a single attention mask from one layer
+            # and applies it to all attention layers.
+            # NOTE: only check layers explicitly typed as 'KVCache'.
+            # RotatingKVCache also has 'offset' but its meaning differs
+            # (total tokens ever processed, not buffer size), so mixing
+            # them would produce false positives.
+            if layer_cache_types:
+                kv_offsets = set()
+                for idx, c in enumerate(reconstructed_caches):
+                    if (idx < len(layer_cache_types)
+                            and layer_cache_types[idx] == 'KVCache'
+                            and hasattr(c, 'offset')
+                            and isinstance(getattr(c, 'offset', None), int)):
+                        kv_offsets.add(c.offset)
+                if len(kv_offsets) > 1:
+                    logger.warning(
+                        f"KVCache offset inconsistency after reconstruction: "
+                        f"{kv_offsets}. Rejecting cache to prevent "
+                        f"broadcast_shapes errors."
+                    )
+                    return None
 
             logger.debug(
                 f"Reconstructed cache from tiered cache: {len(reconstructed_caches)} layers, "
@@ -1821,7 +1980,7 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         tokens: List[int],
         extra_keys: Optional[Tuple[Any, ...]] = None,
-    ) -> Optional[Tuple[int, List[int], int]]:
+    ) -> Optional[Tuple[int, Tuple[int, ...], int]]:
         """Find best matching prefix in the index."""
         best_match = None
         best_len = 0
@@ -1884,7 +2043,7 @@ class BlockAwarePrefixCache(CacheManager):
 
             parent_hash = block_hash
             prefix_len += len(block_tokens)
-            self._prefix_index[block_hash] = (prefix_len, block_ids, i + 1)
+            self._prefix_index[block_hash] = (prefix_len, tuple(block_ids[: i + 1]), i + 1)
 
     def get_stats(self) -> PrefixCacheStats:
         """
@@ -1898,6 +2057,11 @@ class BlockAwarePrefixCache(CacheManager):
             misses=self._misses,
             evictions=self.paged_cache.stats.evictions,
             tokens_saved=self._tokens_saved,
+            partial_block_skips=self._partial_block_skips,
+            partial_tokens_skipped=self._partial_tokens_skipped,
+            block_size=self.block_size,
+            last_partial_tokens_skipped=self._last_partial_tokens_skipped,
+            last_tokens_to_next_block=self._last_tokens_to_next_block,
         )
 
     def get_stats_dict(self) -> Dict[str, Any]:
@@ -1915,6 +2079,11 @@ class BlockAwarePrefixCache(CacheManager):
             "misses": self._misses,
             "hit_rate": self._hits / (self._hits + self._misses) if (self._hits + self._misses) > 0 else 0,
             "tokens_saved": self._tokens_saved,
+            "partial_block_skips": self._partial_block_skips,
+            "partial_tokens_skipped": self._partial_tokens_skipped,
+            "block_size": self.block_size,
+            "last_partial_tokens_skipped": self._last_partial_tokens_skipped,
+            "last_tokens_to_next_block": self._last_tokens_to_next_block,
             "active_requests": len(self._request_tables),
             **paged_stats,
         }
@@ -1924,6 +2093,10 @@ class BlockAwarePrefixCache(CacheManager):
         self._hits = 0
         self._misses = 0
         self._tokens_saved = 0
+        self._partial_block_skips = 0
+        self._partial_tokens_skipped = 0
+        self._last_partial_tokens_skipped = 0
+        self._last_tokens_to_next_block = 0
         self.paged_cache.reset_stats()
 
     def clear(self) -> int:

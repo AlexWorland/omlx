@@ -12,6 +12,35 @@ from .openai_models import Message
 
 
 # =============================================================================
+# Partial Mode Detection
+# =============================================================================
+
+
+def detect_and_strip_partial(messages: list[dict]) -> bool:
+    """Check if the final assistant message has partial=True; strip the field from all messages.
+
+    Partial mode signals that the model should continue from the final assistant
+    message rather than starting a new turn.  The ``partial`` key is not part of
+    the chat-template contract, so it is always removed before the messages are
+    passed to ``apply_chat_template``.
+
+    Args:
+        messages: List of message dicts (mutated in-place).
+
+    Returns:
+        True if the final message is an assistant message with ``partial=True``.
+    """
+    is_partial = (
+        bool(messages)
+        and messages[-1].get("role") == "assistant"
+        and messages[-1].get("partial", False)
+    )
+    for msg in messages:
+        msg.pop("partial", None)
+    return is_partial
+
+
+# =============================================================================
 # Special Token Patterns
 # =============================================================================
 
@@ -69,12 +98,19 @@ def _extract_text_from_content_list(content: list) -> str:
     """
     text_parts = []
     for item in content:
+        # Convert Pydantic models to dict
         if hasattr(item, 'model_dump'):
             item = item.model_dump()
         elif hasattr(item, 'dict'):
             item = item.dict()
-        if isinstance(item, dict) and item.get("type") == "text":
-            text_parts.append(item.get("text", ""))
+        
+        if isinstance(item, dict):
+            if item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+        elif isinstance(item, str):
+            # Direct string in content list
+            text_parts.append(item)
+    
     return "\n".join(text_parts) if text_parts else ""
 
 
@@ -228,7 +264,11 @@ def extract_text_content(
         # Handle tool response messages (role="tool")
         if role == "tool":
             tool_call_id = getattr(msg, 'tool_call_id', None) or ''
-            tool_content = content if content else ""
+            # Convert list content to string if needed
+            if isinstance(content, list):
+                tool_content = _extract_text_from_content_list(content)
+            else:
+                tool_content = content if content else ""
             # Apply truncation if configured
             if max_tool_result_tokens and tokenizer and tool_content:
                 from .anthropic_utils import truncate_tool_result
@@ -256,6 +296,8 @@ def extract_text_content(
             if isinstance(content, list):
                 content = _extract_text_from_content_list(content)
             msg_dict = {"role": role, "content": content if content else ""}
+            if getattr(msg, 'name', None):
+                msg_dict["name"] = msg.name
 
             # Preserve structured tool_calls for models with native tool calling
             # so the chat template renders them in the model's native format.
@@ -309,21 +351,28 @@ def extract_text_content(
             processed_messages.append(msg_dict)
             continue
 
+        # Build optional extra fields from the source message
+        _extra: dict = {}
+        if getattr(msg, 'name', None):
+            _extra["name"] = msg.name
+        if getattr(msg, 'partial', False):
+            _extra["partial"] = True
+
         # Handle None content
         if content is None:
-            processed_messages.append({"role": role, "content": ""})
+            processed_messages.append({"role": role, "content": "", **_extra})
             continue
 
         if isinstance(content, str):
             # Simple text message
-            processed_messages.append({"role": role, "content": content})
+            processed_messages.append({"role": role, "content": content, **_extra})
         elif isinstance(content, list):
             # Content array - extract text parts only
             combined_text = _extract_text_from_content_list(content)
-            processed_messages.append({"role": role, "content": combined_text})
+            processed_messages.append({"role": role, "content": combined_text, **_extra})
         else:
             # Unknown format, try to convert
-            processed_messages.append({"role": role, "content": str(content)})
+            processed_messages.append({"role": role, "content": str(content), **_extra})
 
     return _merge_consecutive_roles(
         _consolidate_system_messages(processed_messages)
@@ -361,7 +410,11 @@ def extract_multimodal_content(
         # Tool response messages - same as extract_text_content
         if role == "tool":
             tool_call_id = getattr(msg, 'tool_call_id', None) or ''
-            tool_content = content if content else ""
+            # Convert list content to string if needed
+            if isinstance(content, list):
+                tool_content = _extract_text_from_content_list(content)
+            else:
+                tool_content = content if content else ""
             if max_tool_result_tokens and tokenizer and tool_content:
                 from .anthropic_utils import truncate_tool_result
                 tool_content = truncate_tool_result(
@@ -386,6 +439,8 @@ def extract_multimodal_content(
             if isinstance(content, list):
                 content = _extract_text_from_content_list(content)
             msg_dict = {"role": role, "content": content if content else ""}
+            if getattr(msg, 'name', None):
+                msg_dict["name"] = msg.name
 
             if getattr(tokenizer, 'has_tool_calling', False):
                 tool_calls_list = []
@@ -434,12 +489,19 @@ def extract_multimodal_content(
             processed_messages.append(msg_dict)
             continue
 
+        # Build optional extra fields from the source message
+        _extra: dict = {}
+        if getattr(msg, 'name', None):
+            _extra["name"] = msg.name
+        if getattr(msg, 'partial', False):
+            _extra["partial"] = True
+
         if content is None:
-            processed_messages.append({"role": role, "content": ""})
+            processed_messages.append({"role": role, "content": "", **_extra})
             continue
 
         if isinstance(content, str):
-            processed_messages.append({"role": role, "content": content})
+            processed_messages.append({"role": role, "content": content, **_extra})
         elif isinstance(content, list):
             # Preserve image_url parts for VLM processing
             multimodal_parts = _extract_multimodal_content_list(content)
@@ -448,13 +510,13 @@ def extract_multimodal_content(
             )
             if has_images:
                 # Keep as content list for VLM engine
-                processed_messages.append({"role": role, "content": multimodal_parts})
+                processed_messages.append({"role": role, "content": multimodal_parts, **_extra})
             else:
                 # Text-only, flatten to string
                 combined_text = _extract_text_from_content_list(content)
-                processed_messages.append({"role": role, "content": combined_text})
+                processed_messages.append({"role": role, "content": combined_text, **_extra})
         else:
-            processed_messages.append({"role": role, "content": str(content)})
+            processed_messages.append({"role": role, "content": str(content), **_extra})
 
     return _consolidate_system_messages(processed_messages)
 
@@ -557,7 +619,11 @@ def extract_harmony_messages(
         # Tool response messages - preserve role and tool_call_id
         # Parse content as JSON if possible (chat_template applies |tojson)
         if role == "tool":
-            tool_content = content if content else ""
+            # Convert list content to string if needed
+            if isinstance(content, list):
+                tool_content = _extract_text_from_content_list(content)
+            else:
+                tool_content = content if content else ""
             if max_tool_result_tokens and tokenizer and tool_content:
                 from .anthropic_utils import truncate_tool_result
 
@@ -605,15 +671,7 @@ def extract_harmony_messages(
                 msg_dict["content"] = content
             elif isinstance(content, list):
                 # Extract text parts from content array
-                text_parts = []
-                for item in content:
-                    if hasattr(item, 'model_dump'):
-                        item = item.model_dump()
-                    elif hasattr(item, 'dict'):
-                        item = item.dict()
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text_parts.append(item.get("text", ""))
-                msg_dict["content"] = "\n".join(text_parts)
+                msg_dict["content"] = _extract_text_from_content_list(content)
             else:
                 msg_dict["content"] = str(content)
 
@@ -654,15 +712,7 @@ def extract_harmony_messages(
             processed_messages.append({"role": role, "content": content})
         elif isinstance(content, list):
             # Extract text parts from content array
-            text_parts = []
-            for item in content:
-                if hasattr(item, 'model_dump'):
-                    item = item.model_dump()
-                elif hasattr(item, 'dict'):
-                    item = item.dict()
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text_parts.append(item.get("text", ""))
-            processed_messages.append({"role": role, "content": "\n".join(text_parts)})
+            processed_messages.append({"role": role, "content": _extract_text_from_content_list(content)})
         else:
             processed_messages.append({"role": role, "content": str(content)})
 

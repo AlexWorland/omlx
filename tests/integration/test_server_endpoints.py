@@ -72,7 +72,7 @@ class MockEmbeddingEngineImpl(EmbeddingEngine):
     async def stop(self) -> None:
         pass
 
-    async def embed(self, texts: List[str], **kwargs) -> MockEmbeddingOutput:
+    async def embed(self, texts, **kwargs) -> MockEmbeddingOutput:
         return MockEmbeddingOutput(
             embeddings=[[0.1, 0.2, 0.3] for _ in texts],
             total_tokens=len(texts) * 5,
@@ -247,6 +247,9 @@ class MockEnginePool:
     @property
     def current_model_memory(self) -> int:
         return 1000000
+
+    def get_entry(self, model_id: str):
+        return None
 
     def resolve_model_id(self, model_id_or_alias, settings_manager=None):
         return model_id_or_alias
@@ -865,6 +868,48 @@ class TestEmbeddingsEndpoint:
         assert "total_tokens" in data["usage"]
         assert "embedding" in data["data"][0]
         assert isinstance(data["data"][0]["embedding"], list)
+
+    def test_embeddings_structured_items_input(self, client, mock_engine_pool):
+        """Test embeddings with structured multimodal items."""
+        mock_engine_pool._models.append(
+            {"id": "test-embed-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+
+        response = client.post(
+            "/v1/embeddings",
+            json={
+                "model": "test-embed-model",
+                "items": [
+                    {"text": "hello"},
+                    {"image": "https://example.com/image.jpg"},
+                    {
+                        "text": "hello",
+                        "image": "https://example.com/image.jpg",
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["data"]) == 3
+
+    def test_embeddings_rejects_mixed_input_sources(self, client, mock_engine_pool):
+        """Test embeddings rejects input and items together."""
+        mock_engine_pool._models.append(
+            {"id": "test-embed-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+
+        response = client.post(
+            "/v1/embeddings",
+            json={
+                "model": "test-embed-model",
+                "input": "hello",
+                "items": [{"text": "hello"}],
+            },
+        )
+
+        assert response.status_code == 422
 
 
 class TestRerankEndpoint:

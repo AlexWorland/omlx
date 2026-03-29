@@ -5,6 +5,7 @@ Utility functions for Anthropic Messages API conversion.
 Handles conversion between Anthropic API format and internal oMLX format.
 """
 
+import base64
 import json
 import logging
 import uuid
@@ -24,6 +25,33 @@ from .openai_models import ToolCall
 
 _PRESERVE_ROLE_BOUNDARY = "_preserve_role_boundary"
 logger = logging.getLogger(__name__)
+
+
+def _decode_document_block(block_dict: dict[str, Any]) -> str:
+    """Decode an Anthropic document content block to text.
+
+    For text/plain documents, decodes base64 data and returns the text.
+    For other media types (e.g. PDF), returns a placeholder message since
+    oMLX does not provide document parsing.
+    """
+    source = block_dict.get("source", {})
+    media_type = source.get("media_type", "")
+    data = source.get("data", "")
+    title = block_dict.get("title", "")
+
+    if media_type == "text/plain" and data:
+        try:
+            decoded = base64.b64decode(data).decode("utf-8")
+            label = f"[Document: {title}]\n" if title else ""
+            return f"{label}{decoded}"
+        except Exception:
+            return f"[Document: {title or 'untitled'} — failed to decode]"
+
+    label = title or "untitled"
+    return (
+        f"[Document: {label} ({media_type}) — "
+        f"oMLX does not provide PDF parsing. Send as text instead.]"
+    )
 
 
 def _content_block_to_dict(block: Any) -> dict[str, Any] | None:
@@ -54,6 +82,18 @@ def _append_anthropic_image_part(image_parts: list[dict], block_dict: dict[str, 
                 "url": source.get("url", ""),
             },
         })
+
+
+def _extract_images_from_tool_result_content(
+    content: Any, image_parts: list[dict]
+) -> None:
+    """Extract image blocks from tool result content for VLM processing."""
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image":
+                _append_anthropic_image_part(image_parts, item)
+    elif isinstance(content, dict) and content.get("type") == "image":
+        _append_anthropic_image_part(image_parts, content)
 
 
 def _build_message_from_parts(
@@ -152,6 +192,8 @@ def convert_anthropic_to_internal(
                                     "arguments": tool_input,
                                 },
                             })
+                        elif block_type == "document":
+                            text_parts.append(_decode_document_block(block_dict))
                     msg_dict = _build_message_from_parts(role, text_parts, image_parts) or {
                         "role": role,
                         "content": "",
@@ -191,8 +233,14 @@ def convert_anthropic_to_internal(
                                     tokenizer=tokenizer,
                                 ),
                             })
+                            if preserve_images:
+                                _extract_images_from_tool_result_content(
+                                    block_dict.get("content", ""), image_parts
+                                )
                         elif block_type == "thinking":
                             continue
+                        elif block_type == "document":
+                            text_parts.append(_decode_document_block(block_dict))
                     msg_dict = _build_message_from_parts(role, text_parts, image_parts)
                     if msg_dict:
                         processed_messages.append(msg_dict)
@@ -238,10 +286,17 @@ def convert_anthropic_to_internal(
                     prefix = "[Tool Error" if is_error else "[Tool Result"
                     text_parts.append(f"{prefix} ({tool_use_id})]: {result_content}")
                     saw_tool_markup = True
+                    if preserve_images:
+                        _extract_images_from_tool_result_content(
+                            block_dict.get("content", ""), image_parts
+                        )
 
                 elif block_type == "thinking":
                     # Thinking blocks are ignored (reasoning content is not passed to model)
                     continue
+
+                elif block_type == "document":
+                    text_parts.append(_decode_document_block(block_dict))
 
             msg_dict = _build_message_from_parts(role, text_parts, image_parts) or {
                 "role": role,
@@ -411,6 +466,9 @@ def convert_anthropic_to_internal_harmony(
                 elif block_type == "thinking":
                     # Thinking blocks are ignored (reasoning content is not passed to model)
                     continue
+
+                elif block_type == "document":
+                    text_parts.append(_decode_document_block(block_dict))
 
             # Build message(s) based on what we found
             if role == "assistant":

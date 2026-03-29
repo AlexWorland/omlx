@@ -11,6 +11,7 @@ from omlx.api.utils import (
     _consolidate_system_messages,
     _merge_consecutive_roles,
     clean_output_text,
+    detect_and_strip_partial,
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
@@ -35,6 +36,7 @@ from omlx.api.openai_models import ContentPart, FunctionCall, Message, ToolCall
 from omlx.api.anthropic_models import (
     AnthropicMessage,
     AnthropicTool,
+    ContentBlockDocument,
     ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
@@ -243,6 +245,8 @@ class TestExtractTextContent:
         result = extract_text_content(messages)
 
         assert "Hello" in result[0]["content"]
+        # Ensure content is a string, not a list
+        assert isinstance(result[0]["content"], str)
 
     def test_none_content(self):
         """Test extracting message with None content."""
@@ -268,6 +272,25 @@ class TestExtractTextContent:
         assert result[0]["role"] == "user"  # Converted to user
         assert "call_123" in result[0]["content"]
         assert "success" in result[0]["content"]
+
+    def test_tool_response_message_with_content_part_list(self):
+        """Test extracting tool response with ContentPart list content."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_text_content(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"  # Converted to user
+        assert "call_123" in result[0]["content"]
+        assert "success" in result[0]["content"]
+        # Ensure content is a string, not a list
+        assert isinstance(result[0]["content"], str)
 
     def test_tool_response_fallback_preserves_role_boundary(self):
         """Fallback tool history must not merge into adjacent user turns."""
@@ -580,6 +603,247 @@ class TestConvertAnthropicToInternal:
         assert result[1]["tool_call_id"] == "toolu_123"
         assert result[1]["content"] == "The weather is sunny"
 
+    def test_tool_result_with_image_preserve_images_nonnative(self):
+        """Images in tool_result content are preserved when preserve_images=True (non-native path)."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, preserve_images=True)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        image_parts = [p for p in content if p.get("type") == "image_url"]
+        text_parts = [p for p in content if p.get("type") == "text"]
+        assert len(image_parts) == 1
+        assert "iVBOR" in image_parts[0]["image_url"]["url"]
+        assert len(text_parts) == 1
+        assert "toolu_img" in text_parts[0]["text"]
+
+    def test_tool_result_with_image_no_preserve(self):
+        """Images in tool_result content are NOT preserved when preserve_images=False."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, preserve_images=False)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, str)
+        assert "screenshot.png" in content
+        assert "iVBOR" not in content
+
+    def test_tool_result_with_image_native_path(self):
+        """Images in tool_result are preserved in native tool calling path."""
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockToolUse(
+                            id="toolu_img",
+                            name="read_file",
+                            input={"path": "/tmp/screenshot.png"},
+                        ),
+                    ],
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+            preserve_images=True,
+        )
+
+        # assistant message with tool_calls
+        assert result[0]["role"] == "assistant"
+        # tool result (text only)
+        assert result[1]["role"] == "tool"
+        assert result[1]["content"] == "screenshot.png"
+        # user message with extracted image
+        assert result[2]["role"] == "user"
+        content = result[2]["content"]
+        assert isinstance(content, list)
+        image_parts = [p for p in content if p.get("type") == "image_url"]
+        assert len(image_parts) == 1
+        assert "iVBOR" in image_parts[0]["image_url"]["url"]
+
+    def test_document_block_text_plain(self):
+        """Test converting text/plain document block decodes content."""
+        import base64
+
+        text_data = base64.b64encode(b"Hello from document").decode()
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "text/plain",
+                                "data": text_data,
+                            },
+                            title="notes.txt",
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert "Hello from document" in result[0]["content"]
+        assert "[Document: notes.txt]" in result[0]["content"]
+
+    def test_document_block_pdf_placeholder(self):
+        """Test converting PDF document block returns placeholder."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0xLjQ=",
+                            },
+                            title="manual.pdf",
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "manual.pdf" in content
+        assert "oMLX does not provide PDF parsing" in content
+
+    def test_document_block_mixed_with_text(self):
+        """Test document block alongside text blocks."""
+        import base64
+
+        text_data = base64.b64encode(b"Doc content here").decode()
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockText(text="Please read this:"),
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "text/plain",
+                                "data": text_data,
+                            },
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "Please read this:" in content
+        assert "Doc content here" in content
+
 
 class TestConvertAnthropicToolsToInternal:
     """Tests for convert_anthropic_tools_to_internal function."""
@@ -881,6 +1145,23 @@ class TestExtractHarmonyMessages:
         assert "tool_calls" in result[0]
         assert len(result[0]["tool_calls"]) == 1
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+
+    def test_tool_message_with_content_part_list(self):
+        """Test that tool messages with ContentPart list content are extracted properly."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_123"
+        # Harmony parses JSON content via _try_parse_json for |tojson compatibility
+        assert not isinstance(result[0]["content"], list)
 
     def test_json_arguments_parsed(self):
         """Test that JSON arguments are parsed to dict."""
@@ -1186,6 +1467,24 @@ class TestMergeConsecutiveRoles:
 class TestExtractMultimodalContent:
     """Tests for extract_multimodal_content normalization."""
 
+    def test_tool_message_with_content_part_list(self):
+        """Test that tool messages with ContentPart list content are converted to string."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_multimodal_content(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"  # Converted to user (no has_tool_calling)
+        assert "call_123" in result[0]["content"]
+        assert "success" in result[0]["content"]
+        assert isinstance(result[0]["content"], str)
+
     def test_converts_input_text_and_input_image(self):
         """Responses-style input_text/input_image should normalize for VLM."""
         messages = [
@@ -1225,3 +1524,201 @@ class TestExtractMultimodalContent:
         content = result[0]["content"]
         assert content[1]["type"] == "image_url"
         assert content[1]["image_url"]["url"] == "https://example.com/a.png"
+
+
+# =============================================================================
+# Partial Mode & Name Preservation
+# =============================================================================
+
+
+class TestDetectAndStripPartial:
+    """Tests for detect_and_strip_partial() helper."""
+
+    def test_detects_partial_assistant(self):
+        """Detects partial=True on final assistant message."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+        assert detect_and_strip_partial(messages) is True
+
+    def test_ignores_partial_non_assistant(self):
+        """partial=True on non-assistant final message returns False."""
+        messages = [
+            {"role": "user", "content": "Hello", "partial": True},
+        ]
+        assert detect_and_strip_partial(messages) is False
+
+    def test_strips_partial_from_all_messages(self):
+        """partial field is removed from every message."""
+        messages = [
+            {"role": "user", "content": "Hello", "partial": False},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+        detect_and_strip_partial(messages)
+        for msg in messages:
+            assert "partial" not in msg
+
+    def test_empty_messages(self):
+        """Empty message list returns False without error."""
+        assert detect_and_strip_partial([]) is False
+
+    def test_no_partial_field(self):
+        """Messages without partial field return False."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        assert detect_and_strip_partial(messages) is False
+
+
+class TestExtractTextContentPreservesNamePartial:
+    """Tests that extract_text_content preserves name and partial fields."""
+
+    def test_preserves_name_on_text_message(self):
+        """name field survives extraction for text messages."""
+        messages = [
+            Message(role="assistant", content="Hello", name="Kimi"),
+        ]
+        result = extract_text_content(messages)
+        assert result[0]["name"] == "Kimi"
+
+    def test_preserves_partial_on_assistant(self):
+        """partial field survives extraction for assistant messages."""
+        messages = [
+            Message(role="assistant", content="{", partial=True),
+        ]
+        result = extract_text_content(messages)
+        assert result[0].get("partial") is True
+
+    def test_no_name_when_absent(self):
+        """name key is absent when not set on source message."""
+        messages = [
+            Message(role="user", content="Hello"),
+        ]
+        result = extract_text_content(messages)
+        assert "name" not in result[0]
+
+    def test_no_partial_when_false(self):
+        """partial key is absent when False on source message."""
+        messages = [
+            Message(role="user", content="Hello"),
+        ]
+        result = extract_text_content(messages)
+        assert "partial" not in result[0]
+
+    def test_preserves_name_on_tool_call_message(self):
+        """name field preserved on assistant message with tool_calls."""
+        messages = [
+            Message(
+                role="assistant",
+                content="Let me call a tool",
+                name="Kimi",
+                tool_calls=[{"id": "1", "function": {"name": "search", "arguments": "{}"}}],
+            ),
+        ]
+        result = extract_text_content(messages)
+        assert result[0].get("name") == "Kimi"
+
+    def test_preserves_name_in_multimodal_extraction(self):
+        """name field survives multimodal extraction."""
+        messages = [
+            Message(role="assistant", content="Hello", name="Kimi"),
+        ]
+        result = extract_multimodal_content(messages)
+        assert result[0]["name"] == "Kimi"
+
+
+class TestNameFieldSchemaAcceptance:
+    """Tests that the `name` field is accepted by the Message schema.
+
+    The `name` field is part of the OpenAI chat completion spec and used by
+    models like Kimi K2/K2.5 for named-assistant persona rendering.  Many
+    templates silently ignore it, so we cannot reliably assert on template
+    output — but we CAN verify that the schema accepts it without error
+    and that it survives message extraction for templates that do use it.
+
+    On models that support it, the assistant `name` field acts as a
+    probability space constraint — the same prompt produces distinctly
+    different character voices depending on the name.  Models that ignore
+    it simply drop the field harmlessly.
+
+    Validated on Kimi-K2-Instruct-0905-mlx-3bit with a HHGTTG roleplay
+    scenario (system: turn-based RP, user: Arthur banging on bathroom
+    door, assistant: partial prefill "*" with name set).  Same prompt,
+    three names, three distinct voices:
+
+        name="Marvin the Paranoid Android":
+            *door creaks open* ... "A damp towel is flung over the
+            shower rail like a limp flag of surrender."
+
+        name="Ford Prefect":
+            *door slides open* ... "I seem to have mistaken this door
+            for the entry to the relaxation chamber of the Starship
+            Heart of Gold."
+
+        name="Zaphod Beeblebrox":
+            "Yes, yes, an hour is precisely how long it takes to
+            negotiate a cease-fire between the fungal colonies behind
+            the soap dish and the mildew syndicate under the sink."
+    """
+
+    def test_name_field_accepted_on_all_roles(self):
+        """Message schema accepts name on user, assistant, and system roles."""
+        msgs = [
+            Message(
+                role="system",
+                content="This is a turn-based roleplaying session set in the "
+                "Hitchhiker's Guide to the Galaxy universe.",
+            ),
+            Message(
+                role="user",
+                content="*bangs on the bathroom door* Oi! It's been an hour! "
+                "Some of us need to use the facilities too, you know!",
+                name="Arthur Dent",
+            ),
+            Message(
+                role="assistant",
+                content="*",
+                name="Marvin the Paranoid Android",
+                partial=True,
+            ),
+        ]
+        # No ValidationError raised — schema accepts name on all roles
+        assert msgs[1].name == "Arthur Dent"
+        assert msgs[2].name == "Marvin the Paranoid Android"
+
+    def test_name_field_survives_extraction_for_template(self):
+        """name is carried through extract_text_content so templates can render it."""
+        msgs = [
+            Message(
+                role="system",
+                content="This is a turn-based roleplaying session set in the "
+                "Hitchhiker's Guide to the Galaxy universe.",
+            ),
+            Message(
+                role="user",
+                content="*bangs on the bathroom door* Oi! It's been an hour! "
+                "Some of us need to use the facilities too, you know!",
+                name="Arthur Dent",
+            ),
+            Message(
+                role="assistant",
+                content="*",
+                name="Marvin the Paranoid Android",
+                partial=True,
+            ),
+        ]
+        result = extract_text_content(msgs)
+
+        # system message is consolidated to front; user and assistant follow
+        assert result[1]["name"] == "Arthur Dent"
+        assert result[2]["name"] == "Marvin the Paranoid Android"
+        # partial also survives for the engine to consume
+        assert result[2]["partial"] is True
+
+    def test_name_absent_when_not_provided(self):
+        """name key does not leak into message dicts when not set."""
+        msgs = [Message(role="user", content="Hello")]
+        result = extract_text_content(msgs)
+        assert "name" not in result[0]

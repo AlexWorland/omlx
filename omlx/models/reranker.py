@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Tuple
 
+import mlx.core as mx
+
 from ..model_discovery import (
     CAUSAL_LM_RERANKER_ARCHITECTURES,
     SUPPORTED_RERANKER_ARCHITECTURES,
@@ -84,10 +86,15 @@ class MLXRerankerModel:
         self._loaded = False
         self._num_labels: int | None = None
         self._is_causal_lm = False
+        self._is_jina_reranker = False
         self._token_true_id: int | None = None
         self._token_false_id: int | None = None
+        self._score_token_id: int | None = None
+        self._rerank_token_id: int | None = None
         self._prefix_tokens: list[int] | None = None
         self._suffix_tokens: list[int] | None = None
+        self._is_compiled = False
+        self._compiled_seq_logits = None
 
     def _get_architecture(self) -> str | None:
         """Get the model architecture from config.json."""
@@ -200,6 +207,81 @@ class MLXRerankerModel:
 
         return model, tokenizer
 
+    def _load_jina_reranker(self) -> Tuple[Any, Any]:
+        """
+        Load a Jina v3 reranker model using mlx-lm.
+
+        Jina v3 reranker uses <|score_token|> logits for scoring instead of
+        yes/no logit pairs. The model is based on Qwen3 architecture.
+        """
+        from mlx_lm import load as mlx_lm_load
+
+        model_path = str(self.model_name)
+        model, tokenizer_wrapper = mlx_lm_load(model_path)
+
+        # mlx-lm returns a TokenizerWrapper; unwrap to get the underlying
+        # transformers tokenizer which supports __call__ for batch encoding.
+        tokenizer = getattr(tokenizer_wrapper, "_tokenizer", tokenizer_wrapper)
+
+        # Resolve <|score_token|> and <|rerank_token|> IDs
+        score_token_id = None
+        rerank_token_id = None
+        
+        # Try multiple ways to get token IDs
+        # 1. Check added_tokens_decoder (keys are int IDs, values can be str or Token objects)
+        added_tokens = getattr(tokenizer, "added_tokens_decoder", {}) or {}
+        for tid, tinfo in added_tokens.items():
+            content = ""
+            if isinstance(tinfo, str):
+                content = tinfo
+            elif hasattr(tinfo, "content"):
+                content = tinfo.content
+            elif isinstance(tinfo, dict):
+                content = tinfo.get("content", "")
+            
+            if content == "<|score_token|>":
+                score_token_id = int(tid)
+            elif content == "<|rerank_token|>":
+                rerank_token_id = int(tid)
+        
+        # 2. Fallback to convert_tokens_to_ids
+        if score_token_id is None:
+            try:
+                score_token_id = tokenizer.convert_tokens_to_ids("<|score_token|>")
+            except Exception:
+                pass
+        
+        if rerank_token_id is None:
+            try:
+                rerank_token_id = tokenizer.convert_tokens_to_ids("<|rerank_token|>")
+            except Exception:
+                pass
+        
+        # 3. Fallback to get_added_vocab
+        if score_token_id is None:
+            added_vocab = getattr(tokenizer, "get_added_vocab", lambda: {})()
+            score_token_id = added_vocab.get("<|score_token|>")
+        
+        if rerank_token_id is None:
+            added_vocab = getattr(tokenizer, "get_added_vocab", lambda: {})()
+            rerank_token_id = added_vocab.get("<|rerank_token|>")
+        
+        if score_token_id is None:
+            raise ValueError(
+                "Could not find '<|score_token|>' in tokenizer added_tokens_decoder. "
+                "This model may not be a compatible Jina v3 reranker."
+            )
+
+        self._score_token_id = score_token_id
+        self._rerank_token_id = rerank_token_id
+
+        logger.info(
+            f"Jina reranker tokens: score_token={score_token_id}, "
+            f"rerank_token={rerank_token_id}"
+        )
+
+        return model, tokenizer
+
     def load(self) -> None:
         """Load the model and processor/tokenizer."""
         if self._loaded:
@@ -212,7 +294,12 @@ class MLXRerankerModel:
         logger.info(f"Loading reranker model: {self.model_name} (arch={arch})")
 
         try:
-            if arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
+            if arch == "JinaForRanking":
+                # Jina v3 reranker: uses <|score_token|> logits instead of yes/no
+                self.model, self.processor = self._load_jina_reranker()
+                self._is_jina_reranker = True
+                self._num_labels = 1  # score token
+            elif arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
                 # CausalLM-based reranker (e.g., Qwen3-Reranker)
                 self.model, self.processor = self._load_causal_lm()
                 self._is_causal_lm = True
@@ -231,11 +318,14 @@ class MLXRerankerModel:
                     config = self.model.config
                     self._num_labels = getattr(config, "num_labels", None)
 
+            # Try mx.compile for persistent Metal kernel caching
+            self._is_compiled = self._try_compile()
+
             self._loaded = True
             logger.info(
                 f"Reranker model loaded successfully: {self.model_name} "
                 f"(arch={arch}, num_labels={self._num_labels}, "
-                f"causal_lm={self._is_causal_lm})"
+                f"causal_lm={self._is_causal_lm}, compiled={self._is_compiled})"
             )
 
         except ImportError as e:
@@ -253,6 +343,57 @@ class MLXRerankerModel:
         except Exception as e:
             logger.error(f"Failed to load reranker model: {e}")
             raise
+
+    def _try_compile(self) -> bool:
+        """Compile reranker scoring path to return primitive logits arrays.
+
+        Root-cause fix:
+        - Compiling model.__call__ directly can yield arrays without primitives
+          in some MLX output containers.
+        - Compile a narrow function that returns logits only.
+        """
+        if self._is_causal_lm:
+            # CausalLM reranker path uses generation/logit selection logic;
+            # keep eager path until a dedicated compiled scorer is added.
+            logger.info(
+                f"mx.compile skipped for causal-lm reranker {self.model_name}"
+            )
+            self._compiled_seq_logits = None
+            return False
+
+        base_model = self.model
+        try:
+            def _compiled_seq_logits(inputs):
+                outputs = base_model(**inputs)
+                if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                    return outputs.pooler_output
+                raise ValueError(
+                    "Model output does not contain pooler_output. "
+                    "Ensure the model is a SequenceClassification model."
+                )
+
+            # NOTE: use default compile mode. shapeless=True can fail shape
+            # inference for some linear ops in embedding/reranker stacks.
+            self._compiled_seq_logits = mx.compile(_compiled_seq_logits)
+
+            # Warmup: verify compilation actually works with a dummy forward pass
+            test_inputs = {
+                "input_ids": mx.zeros((1, 4), dtype=mx.int32),
+                "attention_mask": mx.ones((1, 4), dtype=mx.int32),
+            }
+            _ = self._compiled_seq_logits(test_inputs)
+
+            logger.info(
+                f"mx.compile enabled for {self.model_name} "
+                f"(primitive reranker logits path)"
+            )
+            return True
+        except Exception as e:
+            logger.info(
+                f"mx.compile unavailable for {self.model_name}: {e}"
+            )
+            self._compiled_seq_logits = None
+            return False
 
     # Default max_length per model type
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512
@@ -283,7 +424,14 @@ class MLXRerankerModel:
         if not documents:
             return RerankOutput(scores=[], indices=[], total_tokens=0)
 
-        if self._is_causal_lm:
+        if self._is_jina_reranker:
+            effective_max_length = (
+                max_length
+                if max_length is not None
+                else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
+            )
+            return self._rerank_jina(query, documents, effective_max_length)
+        elif self._is_causal_lm:
             effective_max_length = (
                 max_length
                 if max_length is not None
@@ -380,6 +528,84 @@ class MLXRerankerModel:
             total_tokens=total_tokens,
         )
 
+    def _rerank_jina(
+        self,
+        query: str,
+        documents: list[str],
+        max_length: int = 8192,
+    ) -> RerankOutput:
+        """
+        Rerank using Jina v3 reranker with <|score_token|> logits.
+
+        Each document is formatted with <|rerank_token|> instruction and the query,
+        then scored by extracting logits at the <|score_token|> position.
+        """
+        import mlx.core as mx
+
+        tokenizer = self.processor
+        score_token_id = self._score_token_id
+        rerank_token_id = self._rerank_token_id
+
+        # Format instruction
+        rerank_instruct = "Given a query, retrieve relevant documents that answer the query."
+        if rerank_token_id is not None:
+            instruct_tokens = tokenizer.encode(
+                f"<|rerank_token|>{rerank_instruct}", add_special_tokens=False
+            )
+        else:
+            instruct_tokens = tokenizer.encode(rerank_instruct, add_special_tokens=False)
+
+        query_tokens = tokenizer.encode(query, add_special_tokens=False)
+        bos_token_id = getattr(tokenizer, "bos_token_id", None)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+
+        # Compute max content tokens per document
+        # reserved = instruct + query + (BOS if present) + (EOS if present)
+        reserved = len(instruct_tokens) + len(query_tokens)
+        if bos_token_id is not None:
+            reserved += 1
+        if eos_id is not None:
+            reserved += 1
+        max_doc_tokens = max_length - reserved
+
+        scores = []
+        total_tokens = 0
+        for doc in documents:
+            doc_tokens = tokenizer.encode(doc, add_special_tokens=False)[:max_doc_tokens]
+
+            # Build input: [BOS] + instruct + [Query] + query + [Document] + doc + [EOS]
+            input_ids = []
+            if bos_token_id is not None:
+                input_ids.append(bos_token_id)
+            input_ids.extend(instruct_tokens)
+            input_ids.extend(query_tokens)
+            input_ids.extend(doc_tokens)
+            # Add eos if available
+            if eos_id is not None:
+                input_ids.append(eos_id)
+
+            input_ids = input_ids[:max_length]
+            input_array = mx.array([input_ids])
+
+            logits = self.model(input_array)
+            # Get logits at the last position
+            last_logits = logits[0, -1, :]
+            # Extract score token logits (scalar)
+            score_logit = last_logits[score_token_id].item()
+            scores.append(score_logit)
+            total_tokens += len(input_ids)
+
+        # Sort by score descending
+        indexed_scores = list(enumerate(scores))
+        indexed_scores.sort(key=lambda x: x[1], reverse=True)
+        sorted_indices = [idx for idx, _ in indexed_scores]
+
+        return RerankOutput(
+            scores=scores,
+            indices=sorted_indices,
+            total_tokens=total_tokens,
+        )
+
     def _rerank_seq_classification(
         self,
         query: str,
@@ -414,21 +640,39 @@ class MLXRerankerModel:
         input_ids = mx.array(inputs["input_ids"])
         attention_mask = mx.array(inputs["attention_mask"])
 
-        # Forward pass
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
+        # Forward pass (compiled primitive logits path when available)
+        logits = None
+        if self._is_compiled and self._compiled_seq_logits is not None:
+            try:
+                model_inputs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                }
+                logits = self._compiled_seq_logits(model_inputs)
+            except Exception as e:
+                logger.warning(
+                    f"compiled reranker path failed for {self.model_name}: {e}; "
+                    f"disabling compile and falling back to eager forward()"
+                )
+                self._is_compiled = False
+                self._compiled_seq_logits = None
 
-        # Extract scores from pooler_output
-        # pooler_output shape: (batch_size, num_labels)
-        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-            logits = outputs.pooler_output
-        else:
-            raise ValueError(
-                "Model output does not contain pooler_output. "
-                "Ensure the model is a SequenceClassification model."
+        if logits is None:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
             )
+
+            # Extract scores from pooler_output
+            # pooler_output shape: (batch_size, num_labels)
+            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                logits = outputs.pooler_output
+            else:
+                raise ValueError(
+                    "Model output does not contain pooler_output. "
+                    "Ensure the model is a SequenceClassification model."
+                )
+
 
         # Ensure computation is done
         mx.eval(logits)

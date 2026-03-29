@@ -135,6 +135,42 @@ class TestAutoLogin:
             _restore_getter(original)
 
 
+class TestLoginPage:
+    """Tests for GET /admin login page TemplateResponse signature."""
+
+    def test_login_page_uses_new_template_signature(self):
+        """login_page should pass request as first arg to TemplateResponse."""
+        mock_settings = _mock_global_settings(api_key="test-key")
+        original = _patch_getter(mock_settings)
+        try:
+            mock_request = MagicMock()
+            with patch("omlx.admin.auth.verify_session", return_value=False):
+                with patch.object(admin_routes, "templates") as mock_templates:
+                    mock_templates.TemplateResponse.return_value = MagicMock()
+                    asyncio.run(admin_routes.login_page(request=mock_request))
+                    mock_templates.TemplateResponse.assert_called_once_with(
+                        mock_request, "login.html", {"api_key_configured": True}
+                    )
+        finally:
+            _restore_getter(original)
+
+
+class TestDashboardPage:
+    """Tests for GET /admin/dashboard TemplateResponse signature."""
+
+    def test_dashboard_page_uses_new_template_signature(self):
+        """dashboard_page should pass request as first arg to TemplateResponse."""
+        mock_request = MagicMock()
+        with patch.object(admin_routes, "templates") as mock_templates:
+            mock_templates.TemplateResponse.return_value = MagicMock()
+            asyncio.run(
+                admin_routes.dashboard_page(request=mock_request, is_admin=True)
+            )
+            mock_templates.TemplateResponse.assert_called_once_with(
+                mock_request, "dashboard.html", {}
+            )
+
+
 class TestChatPageApiKeyInjection:
     """Tests for GET /admin/chat API key template injection."""
 
@@ -150,8 +186,9 @@ class TestChatPageApiKeyInjection:
                     admin_routes.chat_page(request=mock_request, is_admin=True)
                 )
                 mock_templates.TemplateResponse.assert_called_once_with(
+                    mock_request,
                     "chat.html",
-                    {"request": mock_request, "api_key": "test-chat-key"},
+                    {"api_key": "test-chat-key"},
                 )
         finally:
             _restore_getter(original)
@@ -168,7 +205,7 @@ class TestChatPageApiKeyInjection:
                     admin_routes.chat_page(request=mock_request, is_admin=True)
                 )
                 call_args = mock_templates.TemplateResponse.call_args
-                context = call_args[0][1]
+                context = call_args[0][2]
                 assert context["api_key"] == ""
         finally:
             _restore_getter(original)
@@ -185,7 +222,7 @@ class TestChatPageApiKeyInjection:
                     admin_routes.chat_page(request=mock_request, is_admin=True)
                 )
                 call_args = mock_templates.TemplateResponse.call_args
-                context = call_args[0][1]
+                context = call_args[0][2]
                 assert context["api_key"] == ""
         finally:
             admin_routes._get_global_settings = original
@@ -300,3 +337,87 @@ class TestRememberMe:
     def test_session_max_age_constant(self):
         """SESSION_MAX_AGE should be 24 hours."""
         assert admin_auth.SESSION_MAX_AGE == 86400  # 24 * 60 * 60
+
+
+# =============================================================================
+# Update Check
+# =============================================================================
+
+
+def _make_async_return(value):
+    """Create a coroutine function that returns the given value."""
+
+    async def _coro(*args, **kwargs):
+        return value
+
+    return _coro
+
+
+class _FakeResponse:
+    """Minimal stand-in for requests.Response."""
+
+    def __init__(self, status_code, json_data):
+        self.status_code = status_code
+        self._json = json_data
+
+    def json(self):
+        return self._json
+
+
+class TestCheckUpdate:
+    """Tests for update-check version filtering."""
+
+    def setup_method(self):
+        admin_routes._update_cache = None
+        admin_routes._update_cache_time = 0.0
+
+    @pytest.mark.asyncio
+    async def test_prerelease_not_shown(self):
+        """Dev/pre-release GitHub releases should not trigger update notification."""
+        fake_resp = _FakeResponse(
+            200,
+            {
+                "tag_name": "v99.0.0.dev1",
+                "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0.dev1",
+            },
+        )
+        with patch("omlx.admin.routes.asyncio") as mock_asyncio:
+            mock_asyncio.to_thread = _make_async_return(fake_resp)
+            result = await admin_routes.check_update(is_admin=True)
+
+        assert result["update_available"] is False
+        assert result["latest_version"] is None
+
+    @pytest.mark.asyncio
+    async def test_stable_version_shown(self):
+        """Stable GitHub releases should trigger update notification."""
+        fake_resp = _FakeResponse(
+            200,
+            {
+                "tag_name": "v99.0.0",
+                "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0",
+            },
+        )
+        with patch("omlx.admin.routes.asyncio") as mock_asyncio:
+            mock_asyncio.to_thread = _make_async_return(fake_resp)
+            result = await admin_routes.check_update(is_admin=True)
+
+        assert result["update_available"] is True
+        assert result["latest_version"] == "99.0.0"
+
+    @pytest.mark.asyncio
+    async def test_rc_not_shown(self):
+        """RC releases should not trigger update notification."""
+        fake_resp = _FakeResponse(
+            200,
+            {
+                "tag_name": "v99.0.0rc1",
+                "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0rc1",
+            },
+        )
+        with patch("omlx.admin.routes.asyncio") as mock_asyncio:
+            mock_asyncio.to_thread = _make_async_return(fake_resp)
+            result = await admin_routes.check_update(is_admin=True)
+
+        assert result["update_available"] is False
+        assert result["latest_version"] is None

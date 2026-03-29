@@ -10,7 +10,7 @@ streaming or chat completion.
 import asyncio
 import gc
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 
@@ -82,12 +82,14 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
         gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+        await loop.run_in_executor(
+            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+        )
         logger.info(f"Embedding engine stopped: {self._model_name}")
 
     async def embed(
         self,
-        texts: List[str],
+        texts: Union[List[str], List[Dict[str, str]]],
         max_length: int = 512,
         padding: bool = True,
         truncation: bool = True,
@@ -111,7 +113,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
         def _embed_sync():
             return model.embed(
-                texts=texts,
+                inputs=texts,
                 max_length=max_length,
                 padding=padding,
                 truncation=truncation,

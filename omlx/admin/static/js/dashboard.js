@@ -7,12 +7,16 @@
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
-    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader']);
+    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
+    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
 
     function dashboard() {
         return {
             // Theme
             theme: localStorage.getItem('omlx-chat-theme') || 'light',
+
+            // Mobile menu
+            mobileMenuOpen: false,
 
             // Main tab state (Status, Settings, or Logs)
             mainTab: 'status',
@@ -25,7 +29,7 @@
                 base_path: '',
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
-                memory: { max_process_memory: 'auto' },
+                memory: { max_process_memory: 'auto', prefill_memory_guard: true },
                 scheduler: { max_num_seqs: 8, completion_batch_size: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
@@ -118,6 +122,15 @@
                     total_active_requests: 0,
                     total_waiting_requests: 0,
                 },
+                runtime_cache: {
+                    base_path: '',
+                    ssd_cache_dir: '',
+                    response_state_dir: '',
+                    models: [],
+                    total_num_files: 0,
+                    total_size_bytes: 0,
+                    effective_block_sizes: [],
+                },
             },
             alltimeStats: {
                 total_prompt_tokens: 0,
@@ -131,6 +144,7 @@
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
+            showClearSsdCacheConfirm: false,
             _statsRefreshTimer: null,
 
             // Log viewer state
@@ -180,6 +194,7 @@
             hfRecommendedLoaded: false,
             hfRecommendedLoading: false,
             hfRecommendedTab: 'trending',
+            hfMlxOnly: true,
 
             // Pagination state
             hfPage: { trending: 1, popular: 1, search: 1 },
@@ -218,6 +233,7 @@
             msRecommendedLoaded: false,
             msRecommendedLoading: false,
             msRecommendedTab: 'trending',
+            msMlxOnly: true,
 
             // MS Pagination state
             msPage: { trending: 1, popular: 1, search: 1 },
@@ -237,6 +253,52 @@
             msModelDetail: null,
             msModelDetailLoading: false,
 
+            // oQ Quantizer state
+            oqModels: [],
+            oqAllModels: [],
+            oqModelsLoaded: false,
+            oqSelectedModelPath: '',
+            oqLevel: 4,
+            oqStarting: false,
+            oqTasks: [],
+            oqError: '',
+            oqSuccess: '',
+            _oqRefreshTimer: null,
+            // oQ Advanced Settings
+            oqAdvancedOpen: false,
+            oqEnableClip: false,
+            oqTextOnly: false,
+            oqClipSamples: 128,
+            oqClipSeqLen: 512,
+            oqCalibDataset: 'code_multilingual',
+            oqClipBatchSize: 1024,
+            oqSensitivityModelPath: '',
+            oqExpertBatchSize: 32,
+
+            // oQ Uploader state
+            uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
+            uploadHfUsername: '',
+            uploadHfOrgs: [],
+            uploadHfNamespace: '',
+            uploadTokenValidated: false,
+            uploadTokenValidating: false,
+            uploadOqModels: [],
+            uploadAllModels: [],
+            uploadOqModelsLoaded: false,
+            uploadTasks: [],
+            uploadError: '',
+            uploadSuccess: '',
+            _uploadRefreshTimer: null,
+            // Upload modal
+            uploadModalOpen: false,
+            uploadModalModelPath: '',
+            uploadModalModelName: '',
+            uploadModalRepoId: '',
+            uploadReadmeSource: '',
+            uploadAutoReadme: true,
+            uploadPrivate: false,
+            uploadStarting: false,
+
             // Benchmark state
             benchModelId: '',
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
@@ -245,19 +307,51 @@
             benchBenchId: null,
             benchProgress: null,
             benchSingleResults: [],
-            benchBatchSameResults: [],
-            benchBatchDiffResults: [],
+            benchBatchResults: [],
             benchError: '',
             benchEventSource: null,
             benchShowMetrics: false,
             benchShowText: false,
             benchCopied: false,
             benchTip: null,
-            benchIncludeImage: false,
             benchDeviceInfo: null,
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
+
+            // Bench sub-tab & dropdown
+            benchTab: 'throughput',
+            benchDropdown: false,
+
+            // Accuracy benchmark state
+            accModelId: '',
+            accBenchmarks: { mmlu: true, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, humaneval: true, mbpp: false, livecodebench: false },
+            accSampleSizes: { mmlu: 1000, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, humaneval: 0, mbpp: 200, livecodebench: 100 },
+            accBenchmarkList: [
+                { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
+                { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
+                { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
+                { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+            ],
+            accBatchSize: 1,
+            accRunning: false,
+            accCurrentModel: '',
+            accCurrentBenchId: null,
+            accProgress: null,
+            accAllResults: [],   // accumulated across all models
+            accQueue: [],        // server queue mirror
+            accError: '',
+            accEventSource: null,
+            accShowText: false,
+            accCopied: false,
 
             async init() {
                 // Apply theme
@@ -269,9 +363,6 @@
                     this.loadModels(),
                     this.checkForUpdate()
                 ]);
-                this.$nextTick(() => {
-                    lucide.createIcons();
-                });
 
                 this.startUpdateCheckTimer();
 
@@ -282,8 +373,40 @@
                     this.handleMainTabChange(value);
                 });
 
+                this.$watch('hfMlxOnly', () => {
+                    this.hfRecommended = { trending: [], popular: [] };
+                    this.hfRecommendedLoaded = false;
+                    this.hfSearchResults = [];
+                    this.hfSearchLoaded = false;
+                    this.loadRecommendedModels();
+                    if (this.hfSearchQuery.trim()) {
+                        this.searchHFModels();
+                    }
+                });
+
+                this.$watch('msMlxOnly', () => {
+                    this.msRecommended = { trending: [], popular: [] };
+                    this.msRecommendedLoaded = false;
+                    this.msSearchResults = [];
+                    this.msSearchLoaded = false;
+                    this.loadMsRecommendedModels();
+                    if (this.msSearchQuery.trim()) {
+                        this.searchMSModels();
+                    }
+                });
+
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
+                });
+
+                // Pause stats polling when tab is hidden to reduce server load
+                document.addEventListener('visibilitychange', () => {
+                    if (document.hidden) {
+                        this.stopStatsRefresh();
+                    } else if (this.mainTab === 'status') {
+                        this.loadStats();
+                        this.startStatsRefresh();
+                    }
                 });
             },
 
@@ -301,9 +424,12 @@
                     this.stopLogRefresh();
                 }
                 if (value === 'models') {
-                    const loads = [this.loadHFModels(), this.loadHFTasks()];
+                    const loads = [this.loadHFModels(), this.loadHFTasks(), this.loadOQTasks()];
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
                         loads.push(this.loadRecommendedModels());
+                    }
+                    if (this.modelsTab === 'quantizer') {
+                        loads.push(this.loadOQModels());
                     }
                     if (this.msInitialized && this.msAvailable) {
                         loads.push(this.loadMSTasks());
@@ -315,14 +441,18 @@
                     const hasMsActive = this.msTasks.some(t =>
                         t.status === 'pending' || t.status === 'downloading');
                     if (hasMsActive) this.startMSRefresh();
+                    const hasOqActive = this.oqTasks.some(t =>
+                        ['pending', 'loading', 'quantizing', 'saving'].includes(t.status));
+                    if (hasOqActive) this.startOQRefresh();
                 } else {
                     this.stopHFRefresh();
                     this.stopMSRefresh();
+                    this.stopOQRefresh();
                 }
-                if (value === 'bench' && !this.benchDeviceInfo) {
-                    await this.loadBenchDeviceInfo();
+                if (value === 'bench') {
+                    if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
+                    await this.loadAccState();
                 }
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTabStateFromUrl() {
@@ -331,9 +461,12 @@
                 const settingsTab = params.get('settingsTab');
                 const modelsTab = params.get('modelsTab');
 
+                const benchTab = params.get('benchTab');
+
                 this.mainTab = DASHBOARD_MAIN_TABS.has(mainTab) ? mainTab : 'status';
                 this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
                 this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
+                this.benchTab = DASHBOARD_BENCH_TABS.has(benchTab) ? benchTab : 'throughput';
             },
 
             syncTabStateToUrl() {
@@ -350,6 +483,12 @@
                     url.searchParams.set('modelsTab', this.modelsTab);
                 } else {
                     url.searchParams.delete('modelsTab');
+                }
+
+                if (this.mainTab === 'bench') {
+                    url.searchParams.set('benchTab', this.benchTab);
+                } else {
+                    url.searchParams.delete('benchTab');
                 }
 
                 window.history.replaceState({}, '', url);
@@ -373,6 +512,13 @@
                 this.modelsTab = tab;
                 this.mainTab = 'models';
                 this.syncTabStateToUrl();
+                if (tab === 'quantizer') {
+                    this.loadOQModels();
+                }
+                if (tab === 'uploader') {
+                    if (!this.uploadOqModelsLoaded) this.loadUploadOqModels();
+                    this.loadUploadTasks();
+                }
             },
 
             async checkForUpdate() {
@@ -524,6 +670,7 @@
                             max_model_memory: this.globalSettings.model.max_model_memory,
                             model_fallback: this.globalSettings.model.model_fallback,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
+                            memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
                             max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
                             completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
                             cache_enabled: this.globalSettings.cache.enabled,
@@ -547,7 +694,6 @@
                         const data = await response.json();
                         this.saveSuccess = true;
                         this.saveMessage = data.message || 'Settings saved successfully';
-                        this.$nextTick(() => lucide.createIcons());
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
@@ -559,14 +705,12 @@
                         this.saveError = Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
-                        this.$nextTick(() => lucide.createIcons());
                     }
                 } catch (err) {
                     console.error('Failed to save global settings:', err);
                     this.saveError = window.t('js.error.save_settings_failed');
                     // Reload settings to revert to server values
                     await this.loadGlobalSettings();
-                    this.$nextTick(() => lucide.createIcons());
                 } finally {
                     this.saving = false;
                 }
@@ -639,7 +783,6 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.models = data.models || [];
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -775,15 +918,23 @@
                     min_p: settings.min_p ?? null,
                     presence_penalty: settings.presence_penalty ?? null,
                     force_sampling: settings.force_sampling || false,
+                    enableThinkingBudget: !!(settings.thinking_budget_tokens),
+                    thinking_budget_tokens: settings.thinking_budget_tokens || null,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
+                    reasoning_parser: settings.reasoning_parser || '',
                     ttl_seconds: settings.ttl_seconds ?? null,
                     enableIndexCache: !!(settings.index_cache_freq),
                     index_cache_freq: settings.index_cache_freq || null,
+                    turboquant_kv_enabled: settings.turboquant_kv_enabled || false,
+                    turboquant_kv_bits: settings.turboquant_kv_bits || 4,
+                    specprefill_enabled: settings.specprefill_enabled || false,
+                    specprefill_draft_model: settings.specprefill_draft_model || '',
+                    specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
+                    specprefill_threshold: settings.specprefill_threshold || null,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             async saveModelSettings() {
@@ -827,9 +978,14 @@
                                 min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
                                 force_sampling: this.modelSettings.force_sampling,
+                                reasoning_parser: this.modelSettings.reasoning_parser || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
+                                    : 0,
+                                thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
+                                thinking_budget_tokens: this.modelSettings.enableThinkingBudget
+                                    ? (this.modelSettings.thinking_budget_tokens || null)
                                     : 0,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
@@ -838,6 +994,18 @@
                                     ? chatTemplateKwargs : null,
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
                                     ? forcedCtKwargs : null,
+                                turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
+                                turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
+                                    ? (this.modelSettings.turboquant_kv_bits || 4)
+                                    : 4,
+                                specprefill_enabled: this.modelSettings.specprefill_enabled,
+                                specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
+                                specprefill_keep_pct: this.modelSettings.specprefill_enabled
+                                    ? parseFloat(this.modelSettings.specprefill_keep_pct) || 0.2
+                                    : null,
+                                specprefill_threshold: this.modelSettings.specprefill_enabled
+                                    ? (this.modelSettings.specprefill_threshold || null)
+                                    : null,
                             };
                         })()),
                     });
@@ -915,6 +1083,16 @@
                 return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
             },
 
+            shellQuote(value) {
+                const s = String(value ?? '');
+                if (!s) return "''";
+                return `'${s.replace(/'/g, `'"'"'`)}'`;
+            },
+
+            shellEnvAssign(name, value) {
+                return `${name}=${this.shellQuote(value)}`;
+            },
+
             get claudeCodeCommand() {
                 const mode = this.globalSettings.claude_code.mode;
                 if (mode === 'cloud') {
@@ -926,13 +1104,13 @@
                 const sonnetModel = this.globalSettings.claude_code.sonnet_model || 'select-a-model';
                 const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
-                parts.push(`ANTHROPIC_BASE_URL=http://${this.displayHost}:${port}`);
+                parts.push(this.shellEnvAssign('ANTHROPIC_BASE_URL', `http://${this.displayHost}:${port}`));
                 if (this.stats.api_key) {
-                    parts.push(`ANTHROPIC_AUTH_TOKEN=${this.stats.api_key}`);
+                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', this.stats.api_key));
                 }
-                parts.push(`ANTHROPIC_DEFAULT_OPUS_MODEL=${opusModel}`);
-                parts.push(`ANTHROPIC_DEFAULT_SONNET_MODEL=${sonnetModel}`);
-                parts.push(`ANTHROPIC_DEFAULT_HAIKU_MODEL=${haikuModel}`);
+                parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_OPUS_MODEL', opusModel));
+                parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_SONNET_MODEL', sonnetModel));
+                parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_HAIKU_MODEL', haikuModel));
                 parts.push('API_TIMEOUT_MS=3000000');
                 parts.push('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
                 parts.push('claude');
@@ -964,9 +1142,9 @@
             get codexCommand() {
                 const cli = this.stats.cli_prefix || 'omlx';
                 const model = this.globalSettings.integrations.codex_model || 'select-a-model';
-                const parts = [`${cli} launch codex --model ${model}`];
+                const parts = [`${this.shellQuote(cli)} launch codex --model ${this.shellQuote(model)}`];
                 if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.stats.api_key}`);
+                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
                 }
                 return parts.join(' ');
             },
@@ -974,9 +1152,9 @@
             get opencodeCommand() {
                 const cli = this.stats.cli_prefix || 'omlx';
                 const model = this.globalSettings.integrations.opencode_model || 'select-a-model';
-                const parts = [`${cli} launch opencode --model ${model}`];
+                const parts = [`${this.shellQuote(cli)} launch opencode --model ${this.shellQuote(model)}`];
                 if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.stats.api_key}`);
+                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
                 }
                 return parts.join(' ');
             },
@@ -985,11 +1163,11 @@
                 const cli = this.stats.cli_prefix || 'omlx';
                 const model = this.globalSettings.integrations.openclaw_model || 'select-a-model';
                 const profile = this.globalSettings.integrations.openclaw_tools_profile || 'full';
-                const parts = [`${cli} launch openclaw --model ${model}`];
+                const parts = [`${this.shellQuote(cli)} launch openclaw --model ${this.shellQuote(model)}`];
                 if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.stats.api_key}`);
+                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
                 }
-                parts.push(`--tools-profile ${profile}`);
+                parts.push(`--tools-profile ${this.shellQuote(profile)}`);
                 return parts.join(' ');
             },
 
@@ -1056,7 +1234,6 @@
                         const alltimeData = await alltimeResponse.json();
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
                     }
-                    this.$nextTick(() => lucide.createIcons());
                 } catch (err) {
                     console.error('Failed to load stats:', err);
                 }
@@ -1081,6 +1258,17 @@
                 } catch (err) {
                     console.error('Failed to clear all-time stats:', err);
                     this.showClearAlltimeConfirm = false;
+                }
+            },
+
+            async clearSsdCache() {
+                try {
+                    await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    this.showClearSsdCacheConfirm = false;
+                    await this.loadStats();
+                } catch (err) {
+                    console.error('Failed to clear SSD cache:', err);
+                    this.showClearSsdCacheConfirm = false;
                 }
             },
 
@@ -1191,8 +1379,7 @@
                 this.benchRunning = true;
                 this.benchProgress = null;
                 this.benchSingleResults = [];
-                this.benchBatchSameResults = [];
-                this.benchBatchDiffResults = [];
+                this.benchBatchResults = [];
                 this.benchError = '';
                 this.benchBenchId = null;
                 this.benchUploadResults = [];
@@ -1208,7 +1395,6 @@
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
-                            include_image: this.benchIncludeImage,
                         }),
                     });
 
@@ -1256,10 +1442,8 @@
                         } else if (data.type === 'result') {
                             if (data.data.test_type === 'single') {
                                 this.benchSingleResults = [...this.benchSingleResults, data.data];
-                            } else if (data.data.test_type === 'batch_same') {
-                                this.benchBatchSameResults = [...this.benchBatchSameResults, data.data];
-                            } else if (data.data.test_type === 'batch_diff') {
-                                this.benchBatchDiffResults = [...this.benchBatchDiffResults, data.data];
+                            } else if (data.data.test_type === 'batch') {
+                                this.benchBatchResults = [...this.benchBatchResults, data.data];
                             }
                         } else if (data.type === 'done') {
                             // Benchmark tests done, uploading starts
@@ -1289,7 +1473,6 @@
                             this.loadModels();
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } catch (err) {
                         console.error('Failed to parse SSE event:', err);
                     }
@@ -1399,16 +1582,10 @@
                     }
                 };
 
-                const imgSuffix = this.benchIncludeImage ? ' + image tokens' : '';
                 buildBatchText(
-                    'Continuous Batching — Same Prompt',
-                    `pp1024${imgSuffix} / tg128 · partial prefix cache hit`,
-                    this.benchBatchSameResults
-                );
-                buildBatchText(
-                    'Continuous Batching — Different Prompts',
-                    `pp1024${imgSuffix} / tg128 · no cache reuse`,
-                    this.benchBatchDiffResults
+                    'Continuous Batching',
+                    'pp1024 / tg128',
+                    this.benchBatchResults
                 );
 
                 return lines.join('\n');
@@ -1440,6 +1617,377 @@
                 } catch (err) {
                     console.error('Failed to load device info:', err);
                 }
+            },
+
+            // Bench sub-tab
+            setBenchTab(tab) {
+                if (!DASHBOARD_BENCH_TABS.has(tab)) return;
+                this.benchTab = tab;
+                this.mainTab = 'bench';
+                this.syncTabStateToUrl();
+                if (tab === 'throughput') {
+                    this.loadBenchDeviceInfo();
+                }
+            },
+
+            // Accuracy benchmark functions
+
+            async loadAccState() {
+                // Load accumulated results + queue status from server (page load / tab switch)
+                try {
+                    const resp = await fetch('/admin/api/bench/accuracy/results');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.accAllResults = (data.results || []).map(r => ({ ...r, _showCategories: false }));
+                        this.accRunning = data.running || false;
+                        this.accCurrentModel = data.current_model || '';
+                        if (data.current_bench_id && data.running) {
+                            this.accCurrentBenchId = data.current_bench_id;
+                            this.connectAccSSE(data.current_bench_id);
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load accuracy state:', err);
+                }
+                await this.loadAccQueueStatus();
+            },
+
+            async loadAccQueueStatus() {
+                try {
+                    const resp = await fetch('/admin/api/bench/accuracy/queue/status');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.accQueue = data.queue || [];
+                        this.accRunning = data.running || false;
+                        this.accCurrentModel = data.current_model || '';
+                        if (data.current_bench_id) {
+                            this.accCurrentBenchId = data.current_bench_id;
+                        }
+                        // Restore last progress for reconnect
+                        if (data.last_progress && data.running) {
+                            this.accProgress = data.last_progress;
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load queue status:', err);
+                }
+            },
+
+            async addToAccQueue() {
+                if (!this.accModelId) return;
+                const selected = Object.entries(this.accBenchmarks)
+                    .filter(([_, v]) => v)
+                    .map(([k]) => k);
+                if (selected.length === 0) return;
+
+                this.accError = '';
+
+                try {
+                    const resp = await fetch('/admin/api/bench/accuracy/queue/add', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: this.accModelId,
+                            benchmarks: Object.fromEntries(
+                                selected.map(k => [k, this.accSampleSizes[k]])
+                            ),
+                            batch_size: this.accBatchSize,
+                        }),
+                    });
+                    if (!resp.ok) {
+                        const err = await resp.json();
+                        throw new Error(err.detail || 'Failed to add to queue');
+                    }
+                    const data = await resp.json();
+                    this.accQueue = data.queue || [];
+                    this.accRunning = data.running || false;
+                    this.accCurrentModel = data.current_model || '';
+                    if (data.last_progress) this.accProgress = data.last_progress;
+
+                    // Connect SSE to current run
+                    if (data.current_bench_id) {
+                        this.accCurrentBenchId = data.current_bench_id;
+                        this.connectAccSSE(data.current_bench_id);
+                    }
+                } catch (err) {
+                    this.accError = err.message;
+                }
+            },
+
+            async removeFromAccQueue(idx) {
+                try {
+                    await fetch(`/admin/api/bench/accuracy/queue/${idx}`, { method: 'DELETE' });
+                    await this.loadAccQueueStatus();
+                } catch (err) {
+                    console.error('Failed to remove from queue:', err);
+                }
+            },
+
+            connectAccSSE(benchId) {
+                if (this.accEventSource) {
+                    this.accEventSource.close();
+                }
+                this._stopAccPolling();
+
+                const es = new EventSource(`/admin/api/bench/accuracy/${benchId}/stream`);
+                this.accEventSource = es;
+
+                es.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        switch (data.type) {
+                            case 'progress':
+                                this.accProgress = data;
+                                this.accCurrentModel = data.model_id || this.accCurrentModel;
+                                break;
+                            case 'result':
+                                data.data._showCategories = false;
+                                this.accAllResults.push(data.data);
+                                break;
+                            case 'done':
+                                this.accProgress = null;
+                                es.close();
+                                this.accEventSource = null;
+                                // Check for next in queue
+                                this._pollForNextRun();
+                                break;
+                            case 'error':
+                                this.accError = data.message;
+                                this.accProgress = null;
+                                es.close();
+                                this.accEventSource = null;
+                                this.loadAccQueueStatus();
+                                break;
+                        }
+                    } catch (err) {
+                        console.error('SSE parse error:', err);
+                    }
+                };
+
+                es.onerror = () => {
+                    es.close();
+                    this.accEventSource = null;
+                    // SSE disconnected — fall back to polling
+                    this._startAccPolling();
+                };
+            },
+
+            _startAccPolling() {
+                this._stopAccPolling();
+                this._accPollTimer = setInterval(async () => {
+                    await this.loadAccQueueStatus();
+                    // Load latest results too
+                    try {
+                        const resp = await fetch('/admin/api/bench/accuracy/results');
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            this.accAllResults = (data.results || []).map(r => ({ ...r, _showCategories: false }));
+                        }
+                    } catch (e) {}
+                    // Try to reconnect SSE if running
+                    if (this.accRunning && this.accCurrentBenchId && !this.accEventSource) {
+                        this._stopAccPolling();
+                        this.connectAccSSE(this.accCurrentBenchId);
+                    }
+                    if (!this.accRunning) {
+                        this._stopAccPolling();
+                    }
+                }, 3000);
+            },
+
+            _stopAccPolling() {
+                if (this._accPollTimer) {
+                    clearInterval(this._accPollTimer);
+                    this._accPollTimer = null;
+                }
+            },
+
+            _pollForNextRun() {
+                // After a run completes, poll briefly for the next run to start
+                let attempts = 0;
+                const poll = setInterval(async () => {
+                    attempts++;
+                    await this.loadAccQueueStatus();
+                    if (this.accCurrentBenchId && this.accRunning) {
+                        clearInterval(poll);
+                        this.connectAccSSE(this.accCurrentBenchId);
+                    } else if (!this.accRunning || attempts > 10) {
+                        clearInterval(poll);
+                    }
+                }, 1000);
+            },
+
+            async cancelAccuracyBenchmark() {
+                try {
+                    await fetch('/admin/api/bench/accuracy/cancel', { method: 'POST' });
+                } catch (err) {
+                    console.error('Cancel error:', err);
+                }
+                this.accRunning = false;
+                this.accProgress = null;
+                this.accQueue = [];
+                this.accCurrentModel = '';
+                if (this.accEventSource) {
+                    this.accEventSource.close();
+                    this.accEventSource = null;
+                }
+            },
+
+            async resetAccResults() {
+                try {
+                    await fetch('/admin/api/bench/accuracy/results/reset', { method: 'POST' });
+                    this.accAllResults = [];
+                } catch (err) {
+                    console.error('Reset error:', err);
+                }
+            },
+
+            accBuildText() {
+                if (this.accAllResults.length === 0) return '';
+                const pad = (s, w) => s.toString().padStart(w);
+                const rpad = (s, w) => s.toString().padEnd(w);
+
+                // Group by model
+                const models = [...new Set(this.accAllResults.map(r => r.model_id))];
+                const benchmarks = [...new Set(this.accAllResults.map(r => r.benchmark))];
+
+                // Build lookup: model -> benchmark -> accuracy
+                const lookup = {};
+                for (const r of this.accAllResults) {
+                    if (!lookup[r.model_id]) lookup[r.model_id] = {};
+                    lookup[r.model_id][r.benchmark] = r;
+                }
+
+                // Full sizes lookup
+                const fullSizes = {};
+                for (const bl of this.accBenchmarkList) fullSizes[bl.key] = bl.fullSize;
+
+                // Determine column widths
+                const modelWidth = Math.max(12, ...models.map(m => m.length + 2));
+                const modeW = 8;
+                const sampledW = 14;
+                const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
+
+                let lines = [];
+                lines.push('Intelligence Benchmark Comparison');
+                lines.push('');
+
+                // Header row
+                let header = rpad('', benchWidth) + rpad('Mode', modeW) + rpad('Sampled', sampledW);
+                for (const m of models) header += pad(m, modelWidth);
+                lines.push(header);
+                lines.push('-'.repeat(benchWidth + modeW + sampledW + models.length * modelWidth));
+
+                // Data rows
+                for (const b of benchmarks) {
+                    // Get sample info from first available result for this benchmark
+                    const sample = models.map(m => lookup[m]?.[b]).find(r => r);
+                    const total = sample?.total || 0;
+                    const full = fullSizes[b] || 0;
+                    const isFull = total >= full;
+                    const mode = isFull ? 'Full' : 'Sample';
+                    const sampledStr = isFull ? String(full) : (total + '/' + full);
+
+                    let row = rpad(b.toUpperCase(), benchWidth) + rpad(mode, modeW) + rpad(sampledStr, sampledW);
+                    for (const m of models) {
+                        const r = lookup[m]?.[b];
+                        row += pad(r ? (r.accuracy * 100).toFixed(1) + '%' : '-', modelWidth);
+                    }
+                    lines.push(row);
+                }
+
+                // Detail section per model
+                lines.push('');
+                lines.push('--- Detail ---');
+                for (const m of models) {
+                    lines.push('');
+                    lines.push('Model: ' + m);
+                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10));
+                    lines.push('-'.repeat(54));
+                    for (const r of this.accAllResults.filter(r => r.model_id === m)) {
+                        lines.push(
+                            rpad(r.benchmark.toUpperCase(), 16) +
+                            pad((r.accuracy * 100).toFixed(1) + '%', 10) +
+                            pad(r.correct, 10) +
+                            pad(r.total, 8) +
+                            pad(r.time_s, 10)
+                        );
+                    }
+                }
+
+                return lines.join('\n');
+            },
+
+            accCopyText() {
+                const text = this.accBuildText();
+                const onSuccess = () => {
+                    this.accCopied = true;
+                    setTimeout(() => { this.accCopied = false; }, 2000);
+                };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(onSuccess).catch(() => {
+                        const ta = document.getElementById('accTextarea');
+                        if (ta) { ta.select(); document.execCommand('copy'); onSuccess(); }
+                    });
+                } else {
+                    const ta = document.getElementById('accTextarea');
+                    if (ta) { ta.select(); document.execCommand('copy'); onSuccess(); }
+                }
+            },
+
+            accDownloadResult(r, format) {
+                const filename = `${r.model_id}_${r.benchmark}.${format}`;
+                let content, mime;
+                const qr = r.question_results || [];
+
+                if (format === 'json') {
+                    content = JSON.stringify({
+                        model_id: r.model_id,
+                        benchmark: r.benchmark,
+                        accuracy: r.accuracy,
+                        correct: r.correct,
+                        total: r.total,
+                        time_s: r.time_s,
+                        category_scores: r.category_scores || null,
+                        questions: qr,
+                    }, null, 2);
+                    mime = 'application/json';
+                } else if (format === 'csv') {
+                    const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
+                    const lines = ['id,correct,expected,predicted,question,raw_response,time_s'];
+                    for (const q of qr) {
+                        lines.push([q.id, q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                    }
+                    content = lines.join('\n');
+                    mime = 'text/csv';
+                } else {
+                    const lines = [
+                        `Model: ${r.model_id}`,
+                        `Benchmark: ${r.benchmark.toUpperCase()}`,
+                        `Accuracy: ${(r.accuracy * 100).toFixed(1)}% (${r.correct}/${r.total})`,
+                        `Time: ${r.time_s}s`,
+                        '',
+                    ];
+                    for (const q of qr) {
+                        lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
+                        lines.push(`Question: ${q.question || ''}`);
+                        lines.push(`Expected: ${q.expected}`);
+                        lines.push(`Predicted: ${q.predicted}`);
+                        lines.push(`Raw response: ${q.raw_response || '(empty)'}`);
+                        lines.push(`Time: ${q.time_s}s`);
+                        lines.push('');
+                    }
+                    content = lines.join('\n');
+                    mime = 'text/plain';
+                }
+
+                const blob = new Blob([content], { type: mime });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(url);
             },
 
             // Log viewer functions
@@ -1896,7 +2444,6 @@
                 this.theme = this.theme === 'light' ? 'dark' : 'light';
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTheme() {
@@ -1983,7 +2530,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfDownloading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2006,7 +2552,6 @@
                             }
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2022,7 +2567,6 @@
                         const data = await response.json();
                         this.hfModels = data.models || [];
                         this.hfModelsLoaded = true;
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2120,6 +2664,364 @@
             },
 
             // =================================================================
+            // oQ Quantization Functions
+            // =================================================================
+
+            async loadOQModels() {
+                try {
+                    const response = await fetch('/admin/api/oq/models');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.oqModels = data.models || [];
+                        this.oqAllModels = data.all_models || [];
+                        this.oqModelsLoaded = true;
+                    }
+                } catch (err) {
+                    console.error('Failed to load quantizable models:', err);
+                }
+            },
+
+            async startOQQuantization() {
+                if (!this.oqSelectedModelPath || this.oqStarting) return;
+                this.oqError = '';
+                this.oqSuccess = '';
+                this.oqStarting = true;
+                try {
+                    const response = await fetch('/admin/api/oq/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_path: this.oqSelectedModelPath,
+                            oq_level: this.oqLevel,
+                            enable_clip: this.oqEnableClip,
+                            group_size: 64,
+                            clip_num_samples: this.oqClipSamples,
+                            clip_seq_length: this.oqClipSeqLen,
+                            calib_dataset: this.oqCalibDataset,
+                            clip_batch_size: this.oqClipBatchSize,
+                            sensitivity_model_path: this.oqSensitivityModelPath,
+                            text_only: this.oqTextOnly,
+                            expert_batch_size: this.oqExpertBatchSize,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok) {
+                        const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                        const name = model ? model.name : this.oqSelectedModelPath;
+                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}`;
+                        await this.loadOQTasks();
+                        this.startOQRefresh();
+                        setTimeout(() => { this.oqSuccess = ''; }, 5000);
+                    } else {
+                        this.oqError = data.detail || 'Failed to start quantization';
+                    }
+                } catch (err) {
+                    this.oqError = 'Connection error. Server may be unavailable.';
+                } finally {
+                    this.oqStarting = false;
+                }
+            },
+
+            async loadOQTasks() {
+                try {
+                    const response = await fetch('/admin/api/oq/tasks');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.oqTasks = data.tasks || [];
+                        const hasActive = this.oqTasks.some(t =>
+                            ['pending', 'loading', 'quantizing', 'saving'].includes(t.status));
+                        if (!hasActive) {
+                            this.stopOQRefresh();
+                            if (this.oqTasks.some(t => t.status === 'completed')) {
+                                await this.loadHFModels();
+                                await this.loadModels();
+                                await this.loadOQModels();
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load oQ tasks:', err);
+                }
+            },
+
+            async cancelOQTask(taskId) {
+                try {
+                    await fetch(`/admin/api/oq/cancel/${taskId}`, { method: 'POST' });
+                    await this.loadOQTasks();
+                } catch (err) {
+                    console.error('Failed to cancel oQ task:', err);
+                }
+            },
+
+            async removeOQTask(taskId) {
+                try {
+                    await fetch(`/admin/api/oq/task/${taskId}`, { method: 'DELETE' });
+                    await this.loadOQTasks();
+                } catch (err) {
+                    console.error('Failed to remove oQ task:', err);
+                }
+            },
+
+            startOQRefresh() {
+                this.stopOQRefresh();
+                this._oqRefreshTimer = setInterval(() => {
+                    this.loadOQTasks();
+                }, 2000);
+            },
+
+            stopOQRefresh() {
+                if (this._oqRefreshTimer) {
+                    clearInterval(this._oqRefreshTimer);
+                    this._oqRefreshTimer = null;
+                }
+            },
+
+            formatOQProgress(task) {
+                const pct = Math.round(task.progress || 0);
+                return `${pct}% · ${task.phase || task.status}`;
+            },
+
+            formatOQElapsed(task) {
+                if (!task.started_at) return '';
+                const now = task.completed_at || (Date.now() / 1000);
+                const elapsed = now - task.started_at;
+                const mins = Math.floor(elapsed / 60);
+                const secs = Math.floor(elapsed % 60);
+                return `${mins}:${String(secs).padStart(2, '0')}`;
+            },
+
+            oqSensitivityModelCandidates() {
+                if (!this.oqSelectedModelPath) return [];
+                const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!source) return [];
+                return this.oqAllModels.filter(m =>
+                    m.path !== this.oqSelectedModelPath &&
+                    m.is_quantized &&
+                    m.model_type === source.model_type
+                );
+            },
+
+            oqSelectedModelSupportsClip() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.supports_clip || false;
+            },
+
+            oqSelectedModelIsVLM() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.is_vlm || false;
+            },
+
+            oqEstimatedMemory() {
+                // Use precise estimate from API if available
+                if (this.oqEstimate) {
+                    if (this.oqEnableClip) {
+                        return this.oqEstimate.memory_clip_formatted || '';
+                    }
+                    // If sensitivity model selected, memory ≈ sensitivity model size × 1.5
+                    if (this.oqSensitivityModelPath) {
+                        const sensModel = this.oqAllModels.find(m => m.path === this.oqSensitivityModelPath);
+                        if (sensModel) {
+                            const bytes = Math.round(sensModel.size * 1.5) + 5 * 1024 * 1024 * 1024;
+                            if (bytes > 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+                            return (bytes / (1024 * 1024)).toFixed(0) + ' MB';
+                        }
+                    }
+                    return this.oqEstimate.memory_streaming_formatted || '';
+                }
+                // Fallback to rough model-level estimate
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!model) return '';
+                if (this.oqEnableClip) {
+                    return model.memory_clip?.peak_formatted || '';
+                }
+                return model.memory_streaming?.peak_formatted || '';
+            },
+
+            oqEstimate: null,
+            _oqEstimateTimer: null,
+
+            oqEstimatedBpw() {
+                return this.oqEstimate?.effective_bpw?.toFixed(1) || '';
+            },
+
+            oqEstimatedOutputSize() {
+                return this.oqEstimate?.output_size_formatted || '';
+            },
+
+            oqRefreshEstimate() {
+                // Debounce: wait 300ms after last change
+                if (this._oqEstimateTimer) clearTimeout(this._oqEstimateTimer);
+                if (!this.oqSelectedModelPath) {
+                    this.oqEstimate = null;
+                    return;
+                }
+                this._oqEstimateTimer = setTimeout(async () => {
+                    try {
+                        const params = new URLSearchParams({
+                            model_path: this.oqSelectedModelPath,
+                            oq_level: this.oqLevel,
+                        });
+                        const resp = await fetch(`/admin/api/oq/estimate?${params}`);
+                        if (resp.ok) {
+                            this.oqEstimate = await resp.json();
+                        }
+                    } catch (e) {
+                        console.error('Failed to estimate oQ:', e);
+                    }
+                }, 300);
+            },
+
+            // =================================================================
+            // oQ Uploader Functions
+            // =================================================================
+
+            async validateUploadToken() {
+                if (!this.uploadHfToken || this.uploadTokenValidating) return;
+                this.uploadTokenValidating = true;
+                this.uploadError = '';
+                try {
+                    const response = await fetch('/admin/api/upload/validate-token', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ hf_token: this.uploadHfToken }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok) {
+                        this.uploadHfUsername = data.username || '';
+                        this.uploadHfOrgs = data.orgs || [];
+                        this.uploadHfNamespace = this.uploadHfUsername;
+                        this.uploadTokenValidated = true;
+                        localStorage.setItem('omlx-hf-upload-token', this.uploadHfToken);
+                        this.loadUploadOqModels();
+                    } else {
+                        this.uploadError = data.detail || window.t('models.uploader.invalid_token');
+                        this.uploadTokenValidated = false;
+                    }
+                } catch (err) {
+                    this.uploadError = 'Connection error. Server may be unavailable.';
+                } finally {
+                    this.uploadTokenValidating = false;
+                }
+            },
+
+            async loadUploadOqModels() {
+                try {
+                    const response = await fetch('/admin/api/upload/oq-models');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.uploadOqModels = data.oq_models || [];
+                        this.uploadAllModels = data.all_models || [];
+                        this.uploadOqModelsLoaded = true;
+                    }
+                } catch (err) {
+                    console.error('Failed to load oQ models for upload:', err);
+                }
+            },
+
+            openUploadModal(model) {
+                this.uploadModalModelPath = model.path;
+                this.uploadModalModelName = model.name;
+                this.uploadModalRepoId = (this.uploadHfNamespace || this.uploadHfUsername) + '/' + model.name;
+                this.uploadReadmeSource = '';
+                this.uploadAutoReadme = true;
+                this.uploadPrivate = false;
+                this.uploadStarting = false;
+                this.uploadModalOpen = true;
+            },
+
+            async startUpload() {
+                if (!this.uploadModalRepoId || this.uploadStarting) return;
+                this.uploadStarting = true;
+                this.uploadError = '';
+                try {
+                    const response = await fetch('/admin/api/upload/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_path: this.uploadModalModelPath,
+                            repo_id: this.uploadModalRepoId,
+                            hf_token: this.uploadHfToken,
+                            readme_source_path: this.uploadReadmeSource,
+                            auto_readme: this.uploadAutoReadme,
+                            private: this.uploadPrivate,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok) {
+                        this.uploadModalOpen = false;
+                        this.uploadSuccess = `Upload queued: ${this.uploadModalModelName}`;
+                        await this.loadUploadTasks();
+                        this.startUploadRefresh();
+                        setTimeout(() => { this.uploadSuccess = ''; }, 5000);
+                    } else {
+                        this.uploadError = data.detail || 'Failed to start upload';
+                    }
+                } catch (err) {
+                    this.uploadError = 'Connection error. Server may be unavailable.';
+                } finally {
+                    this.uploadStarting = false;
+                }
+            },
+
+            async loadUploadTasks() {
+                try {
+                    const response = await fetch('/admin/api/upload/tasks');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.uploadTasks = data.tasks || [];
+                        const hasActive = this.uploadTasks.some(t =>
+                            ['pending', 'uploading'].includes(t.status));
+                        if (!hasActive) {
+                            this.stopUploadRefresh();
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load upload tasks:', err);
+                }
+            },
+
+            async cancelUploadTask(taskId) {
+                try {
+                    await fetch(`/admin/api/upload/cancel/${taskId}`, { method: 'POST' });
+                    await this.loadUploadTasks();
+                } catch (err) {
+                    console.error('Failed to cancel upload task:', err);
+                }
+            },
+
+            async removeUploadTask(taskId) {
+                try {
+                    await fetch(`/admin/api/upload/task/${taskId}`, { method: 'DELETE' });
+                    await this.loadUploadTasks();
+                } catch (err) {
+                    console.error('Failed to remove upload task:', err);
+                }
+            },
+
+            startUploadRefresh() {
+                this.stopUploadRefresh();
+                this._uploadRefreshTimer = setInterval(() => {
+                    this.loadUploadTasks();
+                }, 2000);
+            },
+
+            stopUploadRefresh() {
+                if (this._uploadRefreshTimer) {
+                    clearInterval(this._uploadRefreshTimer);
+                    this._uploadRefreshTimer = null;
+                }
+            },
+
+            formatUploadElapsed(task) {
+                if (!task.started_at) return '';
+                const now = task.completed_at || (Date.now() / 1000);
+                const elapsed = now - task.started_at;
+                const mins = Math.floor(elapsed / 60);
+                const secs = Math.floor(elapsed % 60);
+                return `${mins}:${String(secs).padStart(2, '0')}`;
+            },
+
+            // =================================================================
             // Recommended Models Functions
             // =================================================================
 
@@ -2128,7 +3030,7 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
-                    const response = await fetch('/admin/api/hf/recommended', { signal: controller.signal });
+                    const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         this.hfRecommended = await response.json();
                         this.hfRecommendedLoaded = true;
@@ -2152,7 +3054,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfRecommendedLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2198,7 +3099,6 @@
 
             setPage(tab, page) {
                 this.hfPage[tab] = page;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // Search
@@ -2214,6 +3114,7 @@
                         q: this.hfSearchQuery,
                         sort: this.hfSearchSort,
                         limit: '100',
+                        mlx_only: this.hfMlxOnly,
                     });
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
@@ -2240,7 +3141,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfSearchLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2311,7 +3211,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfModelDetailLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2352,7 +3251,6 @@
                 if (this.msAvailable) {
                     await this.loadMSTasks();
                 }
-                this.$nextTick(() => lucide.createIcons());
             },
 
             async startMSDownload() {
@@ -2403,7 +3301,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msDownloading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2424,7 +3321,6 @@
                             }
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2504,7 +3400,7 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 20000);
                 try {
-                    const response = await fetch('/admin/api/ms/recommended', { signal: controller.signal });
+                    const response = await fetch(`/admin/api/ms/recommended?mlx_only=${this.msMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
                         this.msRecommended = data;
@@ -2529,7 +3425,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msRecommendedLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2555,7 +3450,6 @@
 
             setMsPage(tab, page) {
                 this.msPage[tab] = page;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // MS Search
@@ -2571,6 +3465,7 @@
                         q: this.msSearchQuery,
                         sort: this.msSearchSort,
                         limit: '50',
+                        mlx_only: this.msMlxOnly,
                     });
                     const response = await fetch(`/admin/api/ms/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
@@ -2595,7 +3490,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msSearchLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2658,7 +3552,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msModelDetailLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
         }

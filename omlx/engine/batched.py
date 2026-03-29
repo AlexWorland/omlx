@@ -12,11 +12,12 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens
+from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+
 
 # Optional Harmony adapter import
 try:
@@ -67,6 +68,8 @@ class BatchedEngine(BaseEngine):
         self._tokenizer = None
         self._engine = None
         self._loaded = False
+        self._grammar_compiler = None
+        self._grammar_compiler_init_attempted = False
 
     @property
     def model_name(self) -> str:
@@ -101,6 +104,26 @@ class BatchedEngine(BaseEngine):
         except Exception as e:
             logger.debug(f"Error getting model_type: {e}")
         return None
+
+    @property
+    def grammar_compiler(self):
+        """Lazily create and return a GrammarCompiler for this model.
+
+        Returns ``None`` when xgrammar is not installed or initialization fails.
+        """
+        if self._grammar_compiler is not None:
+            return self._grammar_compiler
+        if self._grammar_compiler_init_attempted:
+            return None
+        self._grammar_compiler_init_attempted = True
+        try:
+            from ..api.grammar import create_grammar_compiler
+
+            self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._model)
+            logger.info("GrammarCompiler initialized for %s", self._model_name)
+        except Exception as e:
+            logger.warning("Failed to initialize GrammarCompiler: %s", e)
+        return self._grammar_compiler
 
     def _preprocess_messages(
         self, messages: list[dict[str, Any]]
@@ -160,6 +183,15 @@ class BatchedEngine(BaseEngine):
             self._model, self._model_settings
         )
 
+        # TurboQuant KV cache: patch attention and set kv_bits on scheduler
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                apply_turboquant_attention_patch()
+                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
         scheduler_config.model_name = self._model_name  # Ensure cache isolation per model
@@ -177,6 +209,31 @@ class BatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # TurboQuant KV cache: propagate bits to scheduler
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+
+        # SpecPrefill: load draft model and pass to scheduler
+        if self._model_settings is not None:
+            specprefill_draft = getattr(self._model_settings, "specprefill_draft_model", None)
+            specprefill_enabled = getattr(self._model_settings, "specprefill_enabled", False)
+            if specprefill_enabled and specprefill_draft:
+                try:
+                    def _load_draft():
+                        draft_model, _ = load(specprefill_draft)
+                        return draft_model
+                    draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)
+                    self._engine.engine.scheduler.set_specprefill_draft_model(
+                        draft_model, draft_model_name=specprefill_draft
+                    )
+                    logger.info(f"SpecPrefill: draft model loaded ({specprefill_draft})")
+                except Exception as e:
+                    logger.error(f"SpecPrefill: draft model load failed: {e}")
+
         self._loaded = True
         logger.info(f"BatchedEngine loaded: {self._model_name}")
 
@@ -206,10 +263,13 @@ class BatchedEngine(BaseEngine):
                 (e.g. enable_thinking, reasoning_effort). Overrides global _enable_thinking.
         """
         if hasattr(self._tokenizer, 'apply_chat_template'):
+            is_partial = detect_and_strip_partial(messages)
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": True,
+                "add_generation_prompt": not is_partial,
             }
+            if is_partial:
+                template_kwargs["continue_final_message"] = True
             if tools:
                 template_kwargs["tools"] = tools
             # Global fallback
@@ -304,10 +364,14 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
 
         output = await self._engine.generate(
@@ -368,15 +432,31 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
+
+        # SpecPrefill: pass per-request overrides to engine
+        specprefill_kwargs = {}
+        if kwargs.get("specprefill") is not None:
+            specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
+        if kwargs.get("specprefill_keep_pct") is not None:
+            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+        if kwargs.get("specprefill_threshold") is not None:
+            specprefill_kwargs["specprefill_threshold"] = kwargs.pop("specprefill_threshold")
+        if kwargs.get("specprefill_system_end") is not None:
+            specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            **specprefill_kwargs,
         )
 
         finished_normally = False
@@ -515,6 +595,24 @@ class BatchedEngine(BaseEngine):
         prompt = self._apply_chat_template(
             messages, template_tools, chat_template_kwargs=ct_kwargs
         )
+
+        # SpecPrefill: compute system prompt token count for protection.
+        # Can't template system-only messages (most templates require user),
+        # so compute by subtracting non-system from full prompt tokens.
+        if kwargs.get("specprefill") is not False:
+            non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
+            if len(non_system) < len(messages) and non_system:
+                try:
+                    non_system_prompt = self._apply_chat_template(
+                        non_system, template_tools, chat_template_kwargs=ct_kwargs
+                    )
+                    full_tokens = len(self._tokenizer.encode(prompt))
+                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+                    system_end = full_tokens - non_system_tokens
+                    if system_end > 0:
+                        kwargs["specprefill_system_end"] = system_end
+                except Exception as e:
+                    logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
         async for output in self.stream_generate(
             prompt=prompt,

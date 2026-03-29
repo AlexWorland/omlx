@@ -281,6 +281,41 @@ class TestDisabledWhenMaxBytesZero:
         assert bg._memory_hard_limit_bytes == 0
 
 
+class TestPrefillMemoryGuardToggle:
+    """Tests for prefill_memory_guard setter and Metal limit management."""
+
+    def test_enable_guard_is_noop_for_metal_limits(self, enforcer):
+        """Enabling guard does NOT call Metal limits (no-op since #429)."""
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            enforcer._running = True
+
+            enforcer.prefill_memory_guard = True
+            assert enforcer.prefill_memory_guard is True
+            mock_mx.set_memory_limit.assert_not_called()
+            mock_mx.set_cache_limit.assert_not_called()
+
+    def test_disable_guard_is_noop_for_metal_limits(self, enforcer):
+        """Disabling guard does NOT call Metal limits (no-op since #429)."""
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            enforcer._running = True
+
+            enforcer.prefill_memory_guard = True
+            enforcer.prefill_memory_guard = False
+            assert enforcer.prefill_memory_guard is False
+            mock_mx.set_memory_limit.assert_not_called()
+            mock_mx.set_cache_limit.assert_not_called()
+
+    def test_disable_guard_noop_without_prior_limits(self, enforcer):
+        """Disabling guard when no limits were set does not call mx."""
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            enforcer._running = True
+
+            # Disable without enabling first
+            enforcer.prefill_memory_guard = False
+            mock_mx.set_memory_limit.assert_not_called()
+            mock_mx.set_cache_limit.assert_not_called()
+
+
 class TestHardLimitCalculation:
     """Tests for _get_hard_limit_bytes calculation."""
 

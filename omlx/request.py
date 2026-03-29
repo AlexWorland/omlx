@@ -58,6 +58,8 @@ class SamplingParams:
     top_p: float = 0.9
     top_k: int = 0  # 0 means disabled
     min_p: float = 0.0
+    xtc_probability: float = 0.0
+    xtc_threshold: float = 0.1
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
@@ -67,6 +69,13 @@ class SamplingParams:
     # Logprobs settings (memory optimization: disabled by default)
     logprobs: bool = False  # Whether to return logprobs
     top_logprobs: Optional[int] = None  # Number of top logprobs (1-20)
+
+    # Thinking budget (None = unlimited thinking)
+    thinking_budget: Optional[int] = None
+
+    # Compiled grammar for constrained decoding (xgrammar CompiledGrammar).
+    # Typed as Any to avoid a hard dependency on xgrammar at import time.
+    compiled_grammar: Any = None
 
     def __post_init__(self):
         if self.stop is None:
@@ -141,6 +150,12 @@ class Request:
 
     # Harmony model support (gpt-oss models)
     is_harmony_model: bool = False      # True if model uses Harmony format
+
+    # SpecPrefill (sparse prefill for MoE models)
+    specprefill_indices: Optional[Any] = None  # mx.array of selected token indices
+    specprefill_total_tokens: int = 0  # Original total token count (M)
+    specprefill_position_offset: int = 0  # RoPE offset = M - N
+    specprefill_system_end: int = 0  # Token index where system prompt ends
 
     # Cache corruption recovery
     cache_corruption_retries: int = 0   # Per-request corruption retry counter

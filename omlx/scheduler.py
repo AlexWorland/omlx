@@ -39,6 +39,22 @@ from .cache.prefix_cache import BlockAwarePrefixCache
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
 
+
+def _sync_and_clear_cache():
+    """Synchronize in-flight GPU work before clearing the Metal buffer cache.
+
+    Without synchronization, mx.clear_cache() can release Metal buffers that
+    are still referenced by in-flight command buffers submitted via
+    mx.async_eval(). This causes the GPU driver to hit a
+    'completeMemory() prepare count underflow' kernel panic on M4 hardware
+    (and SIGSEGV/SIGABRT on M3).
+
+    See: https://github.com/jundot/omlx/issues/300
+    """
+    mx.synchronize(generation_stream)
+    mx.synchronize()  # default stream
+    mx.clear_cache()
+
 # Import tiered cache components
 try:
     from .cache.paged_ssd_cache import PagedSSDCacheManager
@@ -110,6 +126,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         self._boundary_block_size = max(0, int(boundary_block_size))
         self._prefill_boundary_callback = prefill_boundary_callback
         self._abort_check_callback = abort_check_callback
+        self._turboquant_kv_bits: Optional[float] = None  # Set by Scheduler if enabled
         # Memory limits for inline prefill checking (set by Scheduler).
         # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
         self._memory_limit_bytes: int = 0  # soft limit, 0 = disabled
@@ -119,7 +136,44 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         self._vlm_pending: Dict[int, Tuple[mx.array, Dict[str, Any], int]] = {}
 
     # Cache class names known to be sliceable (no boundary snapshots needed).
-    _KNOWN_SLICEABLE = frozenset({"KVCache", "BatchKVCache", "QuantizedKVCache"})
+    _KNOWN_SLICEABLE = frozenset({
+        "KVCache", "BatchKVCache", "QuantizedKVCache",
+        "TurboQuantKVCache", "BatchTurboQuantKVCache",
+    })
+
+    def _apply_turboquant_kv(self, prompt_cache: List[Any]) -> None:
+        """Convert BatchKVCache layers to BatchTurboQuantKVCache."""
+        from .turboquant_kv import BatchTurboQuantKVCache, TurboQuantKVCache
+        from mlx_lm.models.cache import KVCache, CacheList
+
+        converted = 0
+
+        bits = int(self._turboquant_kv_bits)
+        for i, cache_obj in enumerate(prompt_cache):
+            cls_name = type(cache_obj).__name__
+            if cls_name == "BatchKVCache":
+                left_padding = cache_obj.left_padding.tolist()
+                prompt_cache[i] = BatchTurboQuantKVCache(left_padding, bits=bits)
+                converted += 1
+            elif isinstance(cache_obj, KVCache):
+                prompt_cache[i] = TurboQuantKVCache(bits=bits)
+                converted += 1
+            elif isinstance(cache_obj, CacheList):
+                new_caches = []
+                for c in cache_obj.caches:
+                    c_name = type(c).__name__
+                    if c_name == "BatchKVCache":
+                        left_padding = c.left_padding.tolist()
+                        new_caches.append(BatchTurboQuantKVCache(left_padding, bits=bits))
+                        converted += 1
+                    elif isinstance(c, KVCache):
+                        new_caches.append(TurboQuantKVCache(bits=bits))
+                        converted += 1
+                    else:
+                        new_caches.append(c)
+                cache_obj.caches = tuple(new_caches)
+        if converted > 0:
+            logger.info(f"TurboQuant: converted {converted}/{len(prompt_cache)} cache layers to {bits}-bit")
 
     def _boundary_capture_enabled(self) -> bool:
         return (
@@ -292,20 +346,25 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         tokens: List[mx.array],
         **kwargs: Any,
     ):
-        """Override to pass VLM kwargs (inputs_embeds etc.) to self.model()."""
+        """Override to pass VLM kwargs and use batched grammar bitmask fill.
+
+        When grammar-constrained requests are present in the batch:
+        1. Queue model forward (MLX lazy eval)
+        2. Kick off Metal evaluation asynchronously
+        3. Advance grammar state + batch-fill bitmasks on CPU (overlaps
+           with Metal)
+        4. Apply the batched bitmask to all logits at once
+        5. Run remaining (non-grammar) logits processors per-request
+        """
         batch_size = input_tokens.shape[0]
 
         logits = self.model(input_tokens, cache=prompt_cache, **kwargs)
         logits = logits[:, -1, :]
 
         if any(logits_processors):
-            processed_logits = []
-            for e in range(batch_size):
-                sample_logits = logits[e : e + 1]
-                for processor in logits_processors[e]:
-                    sample_logits = processor(tokens[e], sample_logits)
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
+            logits = self._apply_logits_processors(
+                logits, logits_processors, tokens, batch_size,
+            )
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         if any(samplers):
@@ -319,6 +378,111 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             sampled = self.sampler(logprobs)
 
         return sampled, list(logprobs)
+
+    def _apply_logits_processors(
+        self,
+        logits: mx.array,
+        logits_processors: list,
+        tokens: List[mx.array],
+        batch_size: int,
+    ) -> mx.array:
+        """Apply logits processors, using batched grammar fill when possible.
+
+        Separates grammar processors from other processors.  Grammar
+        bitmasks are filled in parallel via ``BatchGrammarMatcher`` while
+        Metal evaluates the model forward pass.  Other processors (e.g.
+        ``ThinkingBudgetProcessor``) run per-request as before.
+        """
+        from .api.grammar import GrammarConstraintProcessor
+
+        grammar_procs: list[tuple[int, GrammarConstraintProcessor]] = []
+        other_procs: list[list] = [[] for _ in range(batch_size)]
+
+        for e in range(batch_size):
+            for proc in logits_processors[e]:
+                if isinstance(proc, GrammarConstraintProcessor):
+                    grammar_procs.append((e, proc))
+                else:
+                    other_procs[e].append(proc)
+
+        if grammar_procs:
+            logits = self._apply_batched_grammar(
+                logits, grammar_procs, tokens, batch_size,
+            )
+
+        if any(other_procs):
+            processed_logits = []
+            for e in range(batch_size):
+                sample_logits = logits[e : e + 1]
+                for processor in other_procs[e]:
+                    sample_logits = processor(tokens[e], sample_logits)
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
+        return logits
+
+    def _apply_batched_grammar(
+        self,
+        logits: mx.array,
+        grammar_procs: list,
+        tokens: List[mx.array],
+        batch_size: int,
+    ) -> mx.array:
+        """Advance grammar state and apply bitmasks using BatchGrammarMatcher.
+
+        Kicks off ``mx.async_eval(logits)`` before CPU-side bitmask
+        computation so that Metal and CPU work overlap.
+        """
+        from xgrammar.kernels.apply_token_bitmask_mlx import apply_token_bitmask_mlx
+
+        mx.async_eval(logits)
+
+        active_matchers = []
+        active_batch_indices = []
+        for batch_idx, proc in grammar_procs:
+            if proc.advance(tokens[batch_idx]):
+                active_matchers.append(proc.matcher)
+                active_batch_indices.append(batch_idx)
+
+        if not active_matchers:
+            return logits
+
+        vocab_size = grammar_procs[0][1]._vocab_size
+        bitmask_width = (vocab_size + 31) // 32
+
+        bitmask = self._get_grammar_bitmask(batch_size, bitmask_width)
+        bitmask[:batch_size] = -1
+
+        if len(active_matchers) >= self._BATCH_GRAMMAR_THRESHOLD:
+            batch_matcher = self._get_batch_grammar_matcher()
+            batch_matcher.batch_fill_next_token_bitmask(
+                active_matchers, bitmask, indices=active_batch_indices,
+            )
+        else:
+            for matcher, idx in zip(active_matchers, active_batch_indices):
+                matcher.fill_next_token_bitmask(bitmask, idx)
+
+        mx_bitmask = mx.array(bitmask[:batch_size])
+        return apply_token_bitmask_mlx(mx_bitmask, logits, vocab_size)
+
+    _BATCH_GRAMMAR_THRESHOLD = 64
+
+    def _get_batch_grammar_matcher(self):
+        """Return a shared ``BatchGrammarMatcher`` (lazy-initialized)."""
+        if not hasattr(self, '_batch_grammar_matcher'):
+            import xgrammar as xgr
+            self._batch_grammar_matcher = xgr.BatchGrammarMatcher()
+        return self._batch_grammar_matcher
+
+    def _get_grammar_bitmask(self, batch_size: int, bitmask_width: int):
+        """Return a reusable numpy bitmask buffer, resizing if needed."""
+        buf = getattr(self, '_grammar_bitmask_buf', None)
+        if buf is None or buf.shape[0] < batch_size or buf.shape[1] < bitmask_width:
+            import numpy as np
+            self._grammar_bitmask_buf = np.full(
+                (max(batch_size, 8), bitmask_width), -1, dtype=np.int32,
+            )
+        return self._grammar_bitmask_buf
 
     def _process_prompts(self, prompts):
         # Clear stale mRoPE position state from prior _process_prompts() call.
@@ -398,6 +562,10 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             inputs = _left_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
 
+            # TurboQuant KV cache: convert KVCache layers to TurboQuantKVCache
+            if self._turboquant_kv_bits is not None:
+                self._apply_turboquant_kv(prompt_cache)
+
             # Build left-padded VLM embeddings batch (matching token padding).
             batched_embeds, batched_extra = self._build_left_padded_vlm_batch(
                 vlm_embeds_map, list(uids), lengths, max_length
@@ -456,7 +624,6 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     emitted=emitted_boundaries,
                     processed_tokens=processed_tokens,
                 )
-                mx.clear_cache()
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
@@ -498,6 +665,12 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                             abort_uids, processed_tokens
                         )
 
+                # Reclaim Metal intermediates between prefill chunks.
+                # Placed after memory check so mx.get_active_memory()
+                # reads pre-clear values, avoiding fragmentation-inflated
+                # readings that caused false model eviction (#396).
+                _sync_and_clear_cache()
+
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
         #   2. Right pad the inputs
@@ -507,6 +680,13 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             last_inputs = mx.array([p[-prompt_checkpoint:] for p in inputs])
             inputs = _right_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _merge_caches(caches)
+
+            # TurboQuant KV cache: convert merged BatchKVCache to
+            # BatchTurboQuantKVCache so cache types stay consistent with
+            # the active batch (prevents _quantized AttributeError in
+            # BatchTurboQuantKVCache.extend()).
+            if self._turboquant_kv_bits is not None:
+                self._apply_turboquant_kv(prompt_cache)
 
             # Build right-padded VLM embeddings batch (matching token padding).
             batched_embeds, batched_extra = self._build_right_padded_vlm_batch(
@@ -571,7 +751,6 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     emitted=emitted_boundaries,
                     processed_tokens=processed_tokens,
                 )
-                mx.clear_cache()
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
@@ -611,6 +790,8 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                             abort_uids, processed_tokens
                         )
 
+                _sync_and_clear_cache()
+
             mx.eval([c.state for c in prompt_cache])
             inputs = last_inputs
 
@@ -643,7 +824,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                 if batched_extra:
                     batched_extra = _advance_vlm_extra(batched_extra, prompt_checkpoint - 1)
 
-        mx.clear_cache()
+        _sync_and_clear_cache()
 
         # Pass remaining VLM embeddings (last token) to _step if available.
         step_kwargs: Dict[str, Any] = {}
@@ -899,7 +1080,7 @@ class SchedulerConfig:
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
-    mlx_cache_cleanup_interval: int = 32  # Steps between mx.clear_cache() calls
+    mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
 
 
 @dataclass
@@ -975,9 +1156,21 @@ class Scheduler:
     3. BatchGenerator processes all running requests together
     4. Finished requests are removed and outputs returned
 
+    .. note::
+
+       ``_DEFERRED_CLEAR_DELAY`` controls how many generation steps to wait
+       after the last request completion before calling ``mx.clear_cache()``.
+       Immediate clearing races with IOKit's asynchronous ``completeMemory()``
+       callbacks, causing 'prepare count underflow' kernel panics (#435).
+       8 steps (~10-40 ms at typical generation speeds) gives IOKit ample
+       time to process those callbacks while still reclaiming Metal buffers
+       fast enough to prevent TTFT spikes (#411).
+
     The key insight is that mlx-lm's BatchGenerator already implements
     continuous batching at the token level, so we use it as the backend.
     """
+
+    _DEFERRED_CLEAR_DELAY: int = 8
 
     def __init__(
         self,
@@ -1009,6 +1202,9 @@ class Scheduler:
         # size to reduce boundary snapshot overhead during prefill.
         self._enlarge_block_size_for_arrays_cache()
 
+        # TurboQuant KV cache (set by engine if model_settings has it enabled)
+        self._turboquant_kv_bits: Optional[float] = None
+
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
         self.running: Dict[str, Request] = {}  # Running requests by ID
@@ -1023,6 +1219,12 @@ class Scheduler:
         # Set by ProcessMemoryEnforcer; propagated to BatchGenerator.
         self._memory_limit_bytes: int = 0  # soft limit
         self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
+        self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
+
+        # SpecPrefill: draft model for attention-based sparse prefill
+        self._specprefill_draft_model: Optional[Any] = None
+        # Track active specprefill request for RoPE cleanup
+        self._specprefill_active_request_id: Optional[str] = None
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
@@ -1140,6 +1342,18 @@ class Scheduler:
 
         # Step counter for periodic cleanup
         self._step_counter = 0
+        # Deferred Metal cache cleanup after request completion.
+        # Immediate mx.clear_cache() after request completion races with
+        # IOKit's asynchronous completeMemory() callbacks, causing
+        # 'prepare count underflow' kernel panics. Deferring the clear
+        # by a few generation steps gives IOKit time to process callbacks.
+        # None = no deferred clear pending; int = steps since last finish.
+        self._deferred_clear_steps: Optional[int] = None
+
+        # Cache XTC special tokens (newline + EOS) — stable per tokenizer.
+        # Must be after _is_harmony_model / _generation_config_eos init
+        # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
+        self._xtc_special_tokens: list[int] = self._get_xtc_special_tokens()
 
     def _calculate_max_blocks(self) -> int:
         """
@@ -1199,12 +1413,24 @@ class Scheduler:
 
         return window_sizes
 
+    # Target range for RotatingKVCache block size alignment.
+    # Using a multiple of window_size within this range reduces SSD I/O
+    # overhead (fewer, larger block files) while keeping cache restore
+    # reprocessing reasonable.
+    _ROTATING_BLOCK_SIZE_MIN = 512
+    _ROTATING_BLOCK_SIZE_MAX = 1024
+
     def _align_block_size_with_rotating_window(self) -> None:
         """
-        Align paged cache block size with RotatingKVCache window size.
+        Align paged cache block size to a multiple of RotatingKVCache
+        window size, targeting 512-1024 tokens per block.
 
-        Strict rotating snapshot restore assumes block boundaries coincide with
-        the rotating window size.
+        Block size must be a multiple of window_size so that block
+        boundaries align with rotation boundaries. When window_size is
+        small (e.g. 128), using it directly as block_size creates too
+        many small files. Instead we pick the smallest multiple of
+        window_size that falls within [_ROTATING_BLOCK_SIZE_MIN,
+        _ROTATING_BLOCK_SIZE_MAX].
         """
         if not self.config.paged_ssd_cache_dir:
             return
@@ -1220,18 +1446,43 @@ class Scheduler:
                 "disable paged cache for this model."
             )
 
-        target_block_size = next(iter(window_sizes))
+        window_size = next(iter(window_sizes))
+
+        # Find the smallest multiple of window_size >= _ROTATING_BLOCK_SIZE_MIN.
+        # If window_size itself is already >= max, just use window_size.
+        lo = self._ROTATING_BLOCK_SIZE_MIN
+        hi = self._ROTATING_BLOCK_SIZE_MAX
+
+        if window_size >= hi:
+            target_block_size = window_size
+        elif window_size >= lo:
+            target_block_size = window_size
+        else:
+            # window_size < lo: pick smallest multiple in [lo, hi]
+            multiplier = (lo + window_size - 1) // window_size  # ceil(lo / ws)
+            target_block_size = multiplier * window_size
+            if target_block_size > hi:
+                # Fall back to largest multiple <= hi
+                target_block_size = (hi // window_size) * window_size
+                if target_block_size < window_size:
+                    target_block_size = window_size
+
         if self.config.paged_cache_block_size != target_block_size:
-            logger.warning(
-                "Aligning paged cache block_size=%s to RotatingKVCache "
-                "window_size=%s for strict boundary snapshots",
+            logger.info(
+                "Aligning paged cache block_size=%s to %s "
+                "(RotatingKVCache window_size=%s, multiplier=%sx)",
                 self.config.paged_cache_block_size,
                 target_block_size,
+                window_size,
+                target_block_size // window_size,
             )
             self.config.paged_cache_block_size = target_block_size
 
     # Default block size for ArraysCache-only hybrid models.
-    _ARRAYS_CACHE_BLOCK_SIZE = 1024
+    # Match prefill_step_size (2048) so that boundary caching ON/OFF
+    # produces identical prefill chunk sizes, eliminating float32↔dtype
+    # roundtrip differences in GatedDeltaNet recurrent state.
+    _ARRAYS_CACHE_BLOCK_SIZE = 2048
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
         """Enlarge block size for ArraysCache-only hybrid models.
@@ -1304,7 +1555,17 @@ class Scheduler:
             import os
             gc_path = os.path.join(model_path, "generation_config.json")
             if not os.path.exists(gc_path):
-                return None
+                # name_or_path may be a HuggingFace repo ID (e.g. for VLM
+                # tokenizers loaded via AutoProcessor).  Try the HF cache.
+                try:
+                    from huggingface_hub import try_to_load_from_cache
+                    cached = try_to_load_from_cache(model_path, "generation_config.json")
+                    if cached and isinstance(cached, str):
+                        gc_path = cached
+                    else:
+                        return None
+                except (ImportError, Exception):
+                    return None
             with open(gc_path) as f:
                 gc = json.load(f)
             eos = gc.get("eos_token_id")
@@ -1458,6 +1719,16 @@ class Scheduler:
                 logger.debug(f"Error finalizing Harmony parser for {request_id}: {e}")
         self._request_detokenizers.pop(f"{request_id}_harmony", None)
 
+    def _get_xtc_special_tokens(self) -> list[int]:
+        """Get special tokens to exclude from XTC sampling (newline + EOS).
+
+        Reuses _get_stop_tokens() for EOS coverage (includes generation_config.json
+        tokens) so XTC exclusions stay consistent with stop-token logic.
+        """
+        tokens = self.tokenizer.encode("\n")
+        tokens.extend(self._get_stop_tokens())
+        return tokens
+
     def _create_batch_generator(self, sampling_params: SamplingParams) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
         sampler = make_sampler(
@@ -1465,6 +1736,9 @@ class Scheduler:
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
             top_k=sampling_params.top_k,
+            xtc_probability=sampling_params.xtc_probability,
+            xtc_threshold=sampling_params.xtc_threshold,
+            xtc_special_tokens=self._xtc_special_tokens,
         )
 
         # Create logits processors for repetition/presence/frequency penalties
@@ -1505,6 +1779,11 @@ class Scheduler:
         )
         bg._memory_limit_bytes = self._memory_limit_bytes
         bg._memory_hard_limit_bytes = self._memory_hard_limit_bytes
+
+        # TurboQuant KV cache: propagate bits setting from Scheduler config
+        if hasattr(self, "_turboquant_kv_bits") and self._turboquant_kv_bits is not None:
+            bg._turboquant_kv_bits = self._turboquant_kv_bits
+
         return bg
 
     def _on_prompt_progress(
@@ -1536,7 +1815,7 @@ class Scheduler:
             )
 
     def _build_sampler_and_processors(
-        self, sampling_params: SamplingParams
+        self, sampling_params: SamplingParams, request: Any = None
     ) -> Tuple[Callable[[mx.array], mx.array], List[Callable]]:
         """Build per-request sampler and logits processors."""
         sampler = make_sampler(
@@ -1544,6 +1823,9 @@ class Scheduler:
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
             top_k=sampling_params.top_k,
+            xtc_probability=sampling_params.xtc_probability,
+            xtc_threshold=sampling_params.xtc_threshold,
+            xtc_special_tokens=self._xtc_special_tokens,
         )
         logits_processors = make_logits_processors(
             repetition_penalty=sampling_params.repetition_penalty
@@ -1556,7 +1838,199 @@ class Scheduler:
             if sampling_params.frequency_penalty != 0.0
             else None,
         )
+
+        # Add thinking budget processor for reasoning models
+        if (
+            sampling_params.thinking_budget is not None
+            and request is not None
+            and getattr(request, 'needs_think_prefix', False)
+            and not getattr(request, 'is_harmony_model', False)
+        ):
+            think_end_ids = self._resolve_think_end_token_ids()
+            if think_end_ids:
+                from .api.thinking import ThinkingBudgetProcessor
+
+                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+                leading_ids, trailing_ids = self._resolve_think_close_pattern()
+                processor = ThinkingBudgetProcessor(
+                    think_end_token_ids=think_end_ids,
+                    budget=sampling_params.thinking_budget,
+                    think_start_token_id=think_start_id,
+                    leading_token_ids=leading_ids,
+                    trailing_token_ids=trailing_ids,
+                )
+                logits_processors.append(processor)
+
+        # Add grammar constraint processor for structured output.
+        # Phase awareness (thinking vs output) is handled by the compiled
+        # grammar itself via xgrammar structural tags, so we don't need
+        # think_end_ids here.
+        if sampling_params.compiled_grammar is not None:
+            try:
+                from .api.grammar import GrammarConstraintProcessor
+
+                vocab_size = self._get_model_vocab_size()
+                if vocab_size is not None:
+                    processor = GrammarConstraintProcessor(
+                        compiled_grammar=sampling_params.compiled_grammar,
+                        vocab_size=vocab_size,
+                    )
+                    logits_processors.append(processor)
+                else:
+                    logger.warning("Cannot determine vocab_size; skipping grammar constraint")
+            except ImportError:
+                logger.warning("xgrammar not installed; skipping grammar constraint")
+
         return sampler, logits_processors
+
+    def _get_model_vocab_size(self) -> int | None:
+        """Return vocab_size from model config, or None if unavailable."""
+        from .utils.tokenizer import resolve_vocab_size
+
+        return resolve_vocab_size(self.model)
+
+    def _resolve_think_end_token_ids(self) -> list[int] | None:
+        """Resolve token ID(s) for the close-think tag.
+
+        Uses mlx-lm's built-in think_end_id which supports both
+        </think> and </longcat_think> automatically.
+        """
+        # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
+        think_end_id = getattr(self.tokenizer, 'think_end_id', None)
+        if think_end_id is not None:
+            return [think_end_id]
+
+        # Tier 2: encode the think_end string
+        think_end_str = getattr(self.tokenizer, 'think_end', '</think>')
+        try:
+            ids = self.tokenizer.encode(think_end_str, add_special_tokens=False)
+            if ids:
+                return list(ids)
+        except Exception:
+            pass
+
+        # Tier 3: direct token lookup
+        try:
+            tid = self.tokenizer.convert_tokens_to_ids("</think>")
+            if tid != getattr(self.tokenizer, 'unk_token_id', None):
+                return [tid]
+        except (AttributeError, KeyError, TypeError):
+            pass
+
+        return None
+
+    def _resolve_think_close_pattern(self) -> tuple[list[int] | None, list[int] | None]:
+        """Detect leading/trailing tokens around </think> from the chat template.
+
+        Different models use different patterns:
+        - Qwen3/3.5, MiniMax: ``\\n</think>\\n\\n``
+        - DeepSeek V3.2, GLM-5: ``</think>`` (no newlines)
+        - GLM-4.6V: ``</think>\\n``
+        - Step-3.5-Flash: ``\\n</think>\\n``
+
+        Returns (leading_token_ids, trailing_token_ids) or (None, None).
+        """
+        import re
+
+        think_end_str = getattr(self.tokenizer, 'think_end', '</think>')
+
+        # Try to get the chat template text
+        template_text = self._get_chat_template_text()
+        if not template_text:
+            return None, None
+
+        # Find the close pattern in the template, e.g. \n</think>\n\n
+        # Look for the think_end_str surrounded by whitespace/newlines in string literals
+        escaped = re.escape(think_end_str)
+        # Match patterns like: \n</think>\n\n or </think> in template strings
+        match = re.search(
+            r'(\\n|\\r|[\n\r])*' + escaped + r'((?:\\n|\\r|[\n\r])*)',
+            template_text,
+        )
+        if not match:
+            return None, None
+
+        # Extract raw leading/trailing whitespace, converting \n escapes to actual newlines
+        raw_leading = (match.group(0).split(think_end_str)[0]
+                       .replace('\\n', '\n').replace('\\r', '\r'))
+        raw_trailing = (match.group(0).split(think_end_str)[1]
+                        .replace('\\n', '\n').replace('\\r', '\r'))
+
+        # Encode to token IDs
+        leading_ids = None
+        trailing_ids = None
+        if raw_leading:
+            try:
+                ids = self.tokenizer.encode(raw_leading, add_special_tokens=False)
+                if ids:
+                    leading_ids = list(ids)
+            except Exception:
+                pass
+        if raw_trailing:
+            try:
+                ids = self.tokenizer.encode(raw_trailing, add_special_tokens=False)
+                if ids:
+                    trailing_ids = list(ids)
+            except Exception:
+                pass
+
+        return leading_ids, trailing_ids
+
+    def _get_chat_template_text(self) -> str | None:
+        """Get chat template text from the tokenizer or model directory."""
+        # Try tokenizer's chat_template attribute (Jinja string)
+        ct = getattr(self.tokenizer, '_chat_template', None)
+        if ct:
+            return ct if isinstance(ct, str) else str(ct)
+        ct = getattr(self.tokenizer, 'chat_template', None)
+        if ct:
+            return ct if isinstance(ct, str) else str(ct)
+
+        # Try reading the .jinja file from model directory
+        import os
+        model_path = getattr(self.config, 'model_name', None) or ''
+        jinja_path = os.path.join(model_path, 'chat_template.jinja')
+        if os.path.isfile(jinja_path):
+            try:
+                with open(jinja_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            except Exception:
+                pass
+
+        return None
+
+    def _detect_needs_think_prefix(self, request: "Request") -> bool:
+        """Detect if prompt ends with an open <think> tag (thinking enabled).
+
+        Returns False for disabled-thinking patterns like <think></think>
+        where </think> immediately follows <think> in the prompt tail.
+        """
+        think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+        if think_start_id is None:
+            try:
+                think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
+                if think_start_id == getattr(self.tokenizer, 'unk_token_id', None):
+                    return False
+            except (AttributeError, KeyError, TypeError):
+                return False
+
+        if not think_start_id or not request.prompt_token_ids:
+            return False
+
+        last_tokens = list(request.prompt_token_ids[-3:])
+        if think_start_id not in last_tokens:
+            return False
+
+        # <think> found. Check if </think> follows it (disabled thinking pattern).
+        last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
+        after_start = last_tokens[last_idx + 1:]
+
+        if after_start:
+            think_end_ids = self._resolve_think_end_token_ids()
+            if think_end_ids and think_end_ids[0] in after_start:
+                return False
+
+        return True
 
     def _ensure_batch_generator(self, sampling_params: SamplingParams) -> None:
         """Ensure BatchGenerator exists with compatible settings."""
@@ -2356,6 +2830,10 @@ class Scheduler:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
 
+        # SpecPrefill: score remaining tokens with draft model if applicable.
+        # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
+        self._try_specprefill_scoring(request)
+
         # Add to tracking
         self.requests[request.request_id] = request
         self.waiting.append(request)
@@ -2363,6 +2841,173 @@ class Scheduler:
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
         )
+
+    def set_specprefill_draft_model(
+        self, draft_model: Any, draft_model_name: Optional[str] = None
+    ) -> None:
+        """Set the draft model for SpecPrefill scoring.
+
+        Creates a separate BlockAwarePrefixCache for the draft model
+        using the existing paged SSD cache infrastructure. The model_name
+        in compute_block_hash() naturally isolates draft blocks from target.
+        """
+        self._specprefill_draft_model = draft_model
+        self._draft_prefix_cache: Optional[Any] = None
+
+        if self.paged_cache_manager is not None and self.paged_ssd_cache_manager is not None:
+            try:
+                from .cache.paged_cache import PagedCacheManager
+                from .cache.prefix_cache import BlockAwarePrefixCache
+
+                name = draft_model_name or "specprefill-draft"
+                draft_paged = PagedCacheManager(
+                    block_size=self.config.paged_cache_block_size,
+                    max_blocks=self.paged_cache_manager.max_blocks,
+                    model_name=name,
+                )
+                self._draft_prefix_cache = BlockAwarePrefixCache(
+                    model=draft_model,
+                    paged_cache_manager=draft_paged,
+                    paged_ssd_cache_manager=self.paged_ssd_cache_manager,
+                )
+                self._draft_prefix_cache.set_cold_restore_callback(
+                    self._restore_block_from_cold
+                )
+                logger.info(
+                    f"SpecPrefill: draft model set with SSD cache (model_name={name})"
+                )
+            except Exception as e:
+                logger.warning(f"SpecPrefill: draft SSD cache setup failed: {e}")
+                logger.info("SpecPrefill: draft model set (no SSD cache)")
+        else:
+            logger.info("SpecPrefill: draft model set (no SSD cache)")
+
+    def _try_specprefill_scoring(self, request: Request) -> None:
+        """Score tokens with draft model if SpecPrefill is applicable.
+
+        Uses paged SSD cache for the draft model: if the prompt prefix
+        was already scored in a previous turn, the draft cache is restored
+        and only the new suffix is prefilled through the draft model.
+        """
+        if self._specprefill_draft_model is None:
+            return
+
+        specprefill_enabled = getattr(request, '_specprefill_enabled', False)
+        if not specprefill_enabled:
+            return
+
+        if request.vlm_inputs_embeds is not None:
+            return
+
+        remaining = request.remaining_tokens or request.prompt_token_ids
+        if remaining is None:
+            return
+
+        n_remaining = len(remaining)
+        from .patches.specprefill import DEFAULT_THRESHOLD, DEFAULT_KEEP_RATE
+        threshold = getattr(request, '_specprefill_threshold', None) or DEFAULT_THRESHOLD
+        keep_pct = getattr(request, '_specprefill_keep_pct', None) or DEFAULT_KEEP_RATE
+
+        # Threshold check on TOTAL remaining (not after system exclusion)
+        if n_remaining <= threshold:
+            return
+
+        # System prompt protection: exclude system tokens from scoring.
+        # If paged cache already covered the system prompt, remaining
+        # won't include it (effective_system = 0).
+        system_end = request.specprefill_system_end
+        effective_system = max(0, system_end - request.cached_tokens)
+        tokens_to_score = remaining[effective_system:] if effective_system > 0 else remaining
+        n_to_score = len(tokens_to_score)
+
+        # If conversation portion is below threshold after system exclusion,
+        # skip SpecPrefill (system will be full-prefilled by normal path)
+        if n_to_score <= threshold:
+            return
+
+        try:
+            import time
+            from .patches.specprefill import score_tokens, select_chunks
+
+            # Draft prefix cache lookup
+            draft_cache = None
+            draft_cached_tokens = 0
+            if self._draft_prefix_cache is not None:
+                try:
+                    block_table, draft_remaining = self._draft_prefix_cache.fetch_cache(
+                        request.request_id, tokens_to_score
+                    )
+                    if block_table and block_table.num_tokens > 0:
+                        reconstructed = self._draft_prefix_cache.reconstruct_cache(block_table)
+                        if reconstructed:
+                            draft_cache = reconstructed
+                            draft_cached_tokens = block_table.num_tokens
+                except Exception as e:
+                    logger.debug(f"SpecPrefill: draft cache fetch failed: {e}")
+
+            t0 = time.monotonic()
+            importance, used_cache = score_tokens(
+                self._specprefill_draft_model,
+                tokens_to_score,
+                prefill_step_size=self.config.prefill_step_size,
+                existing_cache=draft_cache,
+            )
+            selected = select_chunks(importance, keep_pct=keep_pct)
+            t_score = time.monotonic() - t0
+
+            n_selected = selected.shape[0]
+            request.specprefill_indices = selected
+            request.specprefill_total_tokens = n_to_score
+            request.specprefill_position_offset = request.cached_tokens + effective_system
+            request._specprefill_system_tokens = effective_system
+
+            extras = []
+            if draft_cached_tokens > 0:
+                extras.append(f"draft cache hit {draft_cached_tokens}")
+            total_prompt = request.num_prompt_tokens
+            system_total = request.specprefill_system_end
+            cached = request.cached_tokens
+            extras.append(
+                f"prompt {total_prompt} = "
+                f"system {system_total} + conv {total_prompt - system_total}, "
+                f"cached {cached}"
+            )
+
+            logger.info(
+                f"SpecPrefill: scored {n_to_score} tokens in {t_score:.1f}s, "
+                f"selected {n_selected}/{n_to_score} "
+                f"(keep={n_selected/n_to_score*100:.0f}%, {', '.join(extras)})"
+            )
+
+            # Save draft cache for next turn
+            if self._draft_prefix_cache is not None and used_cache is not None:
+                try:
+                    extracted, mcc = self._extract_cache_states(used_cache)
+                    if extracted:
+                        self._draft_prefix_cache.store_cache(
+                            request.request_id,
+                            tokens_to_score,
+                            extracted,
+                            model_cache_config=mcc,
+                        )
+                except Exception as e:
+                    logger.debug(f"SpecPrefill: draft cache store failed: {e}")
+
+            # Free draft cache from memory
+            del used_cache
+            mx.clear_cache()
+
+        except Exception as e:
+            logger.error(f"SpecPrefill scoring failed, falling back to normal path: {e}")
+            request.specprefill_indices = None
+
+    def _cleanup_specprefill(self, request_id: str) -> None:
+        """Clean up SpecPrefill RoPE patches when a request finishes."""
+        if self._specprefill_active_request_id == request_id:
+            from .patches.specprefill import cleanup_rope
+            cleanup_rope(self.model)
+            self._specprefill_active_request_id = None
+            logger.debug(f"SpecPrefill: RoPE restored for finished request {request_id}")
 
     def _trim_prompt_cache_for_generation(self, cache_list: List[Any]) -> bool:
         """Trim each cache layer by one token for exact-hit generation kickoff."""
@@ -2478,6 +3123,13 @@ class Scheduler:
             # Clean up pending VLM embeddings not yet consumed by prefill.
             if self.batch_generator is not None:
                 self.batch_generator._vlm_pending.pop(uid, None)
+            # Synchronize in-flight GPU work before modifying batch state.
+            # batch_generator.remove() triggers lazy KV cache array slicing
+            # (BatchKVCache.filter) that replaces references to arrays still
+            # used by in-flight Metal command buffers from the previous
+            # batch_generator.next() call.  Without this barrier the Metal
+            # driver can hit 'completeMemory() prepare count underflow'.
+            mx.synchronize(generation_stream)
             self._remove_uid_from_active_batch(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
@@ -2543,8 +3195,15 @@ class Scheduler:
         return True
 
     def has_requests(self) -> bool:
-        """Check if there are any pending or running requests."""
-        return bool(self.waiting or self.running)
+        """Check if there are any pending or running requests.
+
+        Also returns True when a deferred Metal cache clear is pending,
+        so that the engine loop keeps calling step() until the clear fires.
+        Without this, an idle server would never increment the deferred
+        counter and stale buffers would accumulate indefinitely.
+        """
+        return bool(self.waiting or self.running
+                     or self._deferred_clear_steps is not None)
 
     def fail_all_requests(self) -> List[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -2577,6 +3236,16 @@ class Scheduler:
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
         self._current_sampler_params = None
+        # Reclaim fragmented Metal buffers after generation failure.
+        # Without this, subsequent requests may hit the same resource
+        # limit even though Python references have been cleared.
+        # Wrapped in try-except because Metal may already be in an error
+        # state — mx.synchronize() or mx.clear_cache() can throw a C++
+        # exception that causes SIGABRT if uncaught (#435).
+        try:
+            _sync_and_clear_cache()
+        except Exception as e:
+            logger.warning(f"Metal cache clear failed during error recovery: {e}")
         return failed_ids
 
     def get_num_waiting(self) -> int:
@@ -2587,7 +3256,57 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _schedule_waiting(self) -> List[Request]:
+    def _preflight_memory_check(self, request: "Request") -> Optional[str]:
+        """
+        Estimate whether prefill would exceed memory limits.
+
+        Computes worst-case peak memory for the last prefill chunk
+        (model weights + KV cache + SDPA attention matrix) and rejects
+        if it would exceed the hard limit.
+
+        For head_dim > 128, MLX SDPA uses a fallback that materializes
+        the full attention matrix [B, n_q, chunk, kv_len] in float32.
+        For head_dim <= 128, MLX uses a fused kernel with O(n) memory.
+
+        Returns:
+            Error message string if request should be rejected, None if OK.
+        """
+        if not self._prefill_memory_guard:
+            return None
+        if self._memory_hard_limit_bytes <= 0:
+            return None
+        if self.memory_monitor is None:
+            return None
+
+        prompt_tokens = request.num_prompt_tokens
+        cached_tokens = request.cached_tokens or 0
+        new_tokens = max(prompt_tokens - cached_tokens, 0)
+
+        if new_tokens == 0:
+            return None
+
+        peak = self.memory_monitor.estimate_prefill_peak_bytes(
+            new_tokens, self.config.prefill_step_size
+        )
+        if peak == 0:
+            return None  # can't estimate, skip
+
+        current = mx.get_active_memory()
+
+        if current + peak > self._memory_hard_limit_bytes:
+            from .utils.hardware import format_bytes
+
+            return (
+                f"Prefill would require ~{format_bytes(current + peak)} peak "
+                f"(model {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+                f"but limit is {format_bytes(self._memory_hard_limit_bytes)}. "
+                f"Reduce context length or increase --max-process-memory."
+            )
+        return None
+
+    def _schedule_waiting(
+        self,
+    ) -> tuple[List["Request"], List[RequestOutput]]:
         """
         Move requests from waiting queue to running.
 
@@ -2596,9 +3315,10 @@ class Scheduler:
         with the same cache status (all with cache or all without) in a single batch.
 
         Returns:
-            List of requests that were scheduled
+            Tuple of (scheduled requests, rejected error outputs)
         """
         scheduled = []
+        rejected_outputs: List[RequestOutput] = []
 
         # Track cache status of first scheduled request to ensure homogeneity
         # None = not determined yet, True = has cache, False = no cache
@@ -2606,8 +3326,28 @@ class Scheduler:
         # Track VLM status: VLM and text-only requests cannot be in the same prefill batch
         # None = not determined yet, True = VLM request, False = text-only request
         batch_vlm_status: Optional[bool] = None
+        # Track SpecPrefill: these requests must be alone (RoPE patching affects whole model)
+        batch_specprefill_status: Optional[bool] = None
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
+            # Generation memory guard: when requests are already running,
+            # defer scheduling if memory pressure is high to prevent
+            # Metal allocation failures during batch_generator.next().
+            # First request always passes (self.running is empty).
+            if (
+                self._prefill_memory_guard
+                and self._memory_limit_bytes > 0
+                and self.running
+            ):
+                active = mx.get_active_memory()
+                if active > self._memory_limit_bytes:
+                    logger.debug(
+                        "Generation memory guard: deferring scheduling "
+                        "(%s > %s), %d running",
+                        active, self._memory_limit_bytes, len(self.running),
+                    )
+                    break
+
             request = self.waiting.popleft()
 
             # Ensure we have a batch generator
@@ -2643,6 +3383,24 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # SpecPrefill requests must be alone in the batch (RoPE patching
+            # affects the entire model). Also block scheduling if another
+            # specprefill request is already running (offset RoPE active).
+            request_is_specprefill = request.specprefill_indices is not None
+            if self._specprefill_active_request_id is not None and not request_is_specprefill:
+                # A specprefill request is running — defer all others until it finishes
+                self.waiting.appendleft(request)
+                break
+            if batch_specprefill_status is None:
+                batch_specprefill_status = request_is_specprefill
+            elif batch_specprefill_status != request_is_specprefill:
+                self.waiting.appendleft(request)
+                break
+            if request_is_specprefill and len(scheduled) > 0:
+                # SpecPrefill request must be alone
+                self.waiting.appendleft(request)
+                break
+
             # Check VLM status homogeneity: VLM and text-only requests use
             # different prefill paths (embeddings vs token IDs)
             request_is_vlm = request.vlm_inputs_embeds is not None
@@ -2670,15 +3428,142 @@ class Scheduler:
                 )
                 break
 
+            # Mark as Harmony model if applicable (before think detection)
+            if self._is_harmony_model:
+                request.is_harmony_model = True
+
+            # Check if prompt ends with <think> token for reasoning models.
+            # Must happen before _build_sampler_and_processors so the thinking
+            # budget processor can check needs_think_prefix.
+            if self._detect_needs_think_prefix(request):
+                request.needs_think_prefix = True
+
             # Per-request sampler/logits processors to avoid BatchGenerator recreation.
             sampler, logits_processors = self._build_sampler_and_processors(
-                request.sampling_params
+                request.sampling_params, request
             )
+
+            # Pre-flight memory guard: estimate peak memory for this request
+            # and reject if it would exceed the hard limit.
+            preflight_error = self._preflight_memory_check(request)
+            if preflight_error:
+                logger.warning(
+                    f"Request {request.request_id} rejected by prefill "
+                    f"memory guard: {preflight_error}"
+                )
+                self.requests.pop(request.request_id, None)
+                rejected_outputs.append(
+                    RequestOutput(
+                        request_id=request.request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error=preflight_error,
+                    )
+                )
+                continue
 
             # Clear stale mRoPE position state to prevent position
             # contamination from prior requests (VLM or text-only).
             if hasattr(self.model, "clear_vlm_position_state"):
                 self.model.clear_vlm_position_state()
+
+            # SpecPrefill: replace tokens with selected subset and pre-fill
+            # cache via sparse_prefill before inserting into BatchGenerator.
+            #
+            # Key design: sparse_prefill processes selected tokens (excluding
+            # the last prompt token). BatchGenerator then processes the last
+            # prompt token to produce generation logits. This avoids:
+            #   - Double-processing the last token (Bug #2)
+            #   - Off-by-one RoPE positions (Bug #1)
+            #
+            # Position math:
+            #   sparse_prefill: N' tokens, adjustment = M - N'
+            #   We subtract 1: adjustment = M - N' - 1
+            #   BatchGenerator last token: pos = N' + (M - N' - 1) = M - 1 ✓
+            #   First gen token: pos = (N'+1) + (M - N' - 1) = M ✓
+            if request.specprefill_indices is not None:
+                try:
+                    from .patches.specprefill import (
+                        sparse_prefill, cleanup_rope,
+                        _find_attention_layers, _get_attn_module,
+                        _OffsetAdjustedRoPE,
+                    )
+                    from mlx_lm.models.cache import make_prompt_cache
+
+                    import time
+                    t0 = time.monotonic()
+
+                    sp_cache = make_prompt_cache(self.model)
+                    all_tokens = tokens_to_process
+                    sys_count = getattr(request, '_specprefill_system_tokens', 0)
+
+                    # Phase 1: system prompt full prefill (if not cached)
+                    if sys_count > 0:
+                        sys_arr = mx.array(all_tokens[:sys_count])
+                        step = self.config.prefill_step_size
+                        while sys_arr.size > step:
+                            self.model(sys_arr[:step][None], cache=sp_cache)
+                            mx.eval([c.state for c in sp_cache])
+                            sys_arr = sys_arr[step:]
+                            mx.clear_cache()
+                        if sys_arr.size > 0:
+                            self.model(sys_arr[None], cache=sp_cache)
+                            mx.eval([c.state for c in sp_cache])
+                        logger.info(
+                            f"SpecPrefill: system prompt {sys_count} tokens full prefill"
+                        )
+
+                    # Phase 2: conversation sparse prefill
+                    conv_tokens = all_tokens[sys_count:]
+                    selected = request.specprefill_indices
+                    M = len(conv_tokens)
+                    pos_offset = request.specprefill_position_offset
+                    last_idx = M - 1
+
+                    # Remove last token from selected set — BatchGenerator
+                    # will process it separately for generation kickoff.
+                    selected_list = selected.tolist()
+                    if last_idx in selected_list:
+                        selected_list.remove(last_idx)
+                        selected = mx.array(sorted(selected_list))
+
+                    sparse_prefill(
+                        self.model,
+                        conv_tokens,
+                        selected,
+                        sp_cache,
+                        step_size=self.config.prefill_step_size,
+                        position_offset=pos_offset,
+                    )
+                    # sparse_prefill installs _OffsetAdjustedRoPE with
+                    # adjustment = M - N'. Subtract 1 to account for the
+                    # extra token BatchGenerator will process.
+                    for _, layer in _find_attention_layers(self.model):
+                        attn = _get_attn_module(layer)
+                        if attn and hasattr(attn, "rope") and isinstance(attn.rope, _OffsetAdjustedRoPE):
+                            attn.rope._adjustment -= 1
+
+                    N = int(selected.shape[0])
+                    t_prefill = time.monotonic() - t0
+                    total_prompt = request.num_prompt_tokens
+                    cached = request.cached_tokens
+                    logger.info(
+                        f"SpecPrefill: sparse prefill {N}/{M} conv tokens in {t_prefill:.1f}s "
+                        f"(total {total_prompt}, cached {cached}, "
+                        f"system {sys_count} full, conv {M} sparse)"
+                    )
+
+                    # Set up request as if we had a prefix cache hit
+                    cache_to_use = sp_cache
+                    # Last token for generation kickoff
+                    tokens_to_process = all_tokens[-1:]
+                    self._specprefill_active_request_id = request.request_id
+
+                except Exception as e:
+                    logger.error(f"SpecPrefill sparse prefill failed: {e}")
+                    cleanup_rope(self.model)
+                    request.specprefill_indices = None
+                    # Fall through to normal prefill
 
             # Insert into BatchGenerator with optional cache
             uids = self.batch_generator.insert(
@@ -2707,28 +3592,6 @@ class Scheduler:
                 self.running[request.request_id] = request
                 scheduled.append(request)
 
-                # Mark as Harmony model if applicable
-                if self._is_harmony_model:
-                    request.is_harmony_model = True
-
-                # Check if prompt ends with <think> token for reasoning models
-                # The chat template may end with "<think>\n" so check last few tokens
-                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-                if think_start_id is None:
-                    # VLM tokenizers loaded via mlx-vlm may not have think_start_id.
-                    # Try to resolve it from the vocabulary directly.
-                    try:
-                        think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
-                        if think_start_id == self.tokenizer.unk_token_id:
-                            think_start_id = None
-                    except (AttributeError, KeyError, TypeError):
-                        pass
-                if think_start_id and request.prompt_token_ids:
-                    # Check last 3 tokens (covers "<think>\n" case)
-                    last_tokens = request.prompt_token_ids[-3:]
-                    if think_start_id in last_tokens:
-                        request.needs_think_prefix = True
-
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
                 cache_used = "with cache" if cache_to_use else "no cache"
@@ -2742,7 +3605,7 @@ class Scheduler:
         if scheduled:
             self._update_stop_tokens()
 
-        return scheduled
+        return scheduled, rejected_outputs
 
     def _process_batch_responses(
         self, responses: List[Any]
@@ -2945,9 +3808,16 @@ class Scheduler:
                             raw_cache = response.prompt_cache
 
                         if raw_cache:
+                            # SpecPrefill: sparse KV data can't be stored in
+                            # paged cache (hash mismatch with full token IDs).
+                            # Prefix blocks from prior normal requests are
+                            # already in paged cache and unaffected.
+                            if request.specprefill_indices is not None:
+                                raw_cache = None
+
                             # For paged cache, extract actual tensor states
                             # This allows cache to survive BatchGenerator recreation
-                            if self.block_aware_cache is not None:
+                            elif self.block_aware_cache is not None:
                                 extracted_cache, model_cache_config = self._extract_cache_states(raw_cache)
                                 if extracted_cache:
                                     request._extracted_cache = extracted_cache
@@ -2970,13 +3840,7 @@ class Scheduler:
                     f"Request {request_id} finished: {response.finish_reason}, "
                     f"{request.num_output_tokens} tokens"
                 )
-                # Log full raw text including <think> prefix so TRACE
-                # output matches what accumulated_text sees in the server.
-                _log_text = output.output_text
-                if getattr(request, 'needs_think_prefix', False):
-                    think_tag = getattr(self.tokenizer, 'think_start', '<think>')
-                    _log_text = think_tag + "\n" + _log_text
-                logger.log(5, "Request %s generated text:\n%s", request_id, _log_text)
+                logger.log(5, "Request %s generated text:\n%s", request_id, output.output_text)
 
             outputs.append(output)
 
@@ -2991,6 +3855,10 @@ class Scheduler:
         # active_batch = None after mx.async_eval when all requests finish.
         if finished_ids:
             mx.synchronize(generation_stream)
+
+        # SpecPrefill: restore original RoPE if active request finished
+        for rid in finished_ids:
+            self._cleanup_specprefill(rid)
 
         # Remove finished requests from prefill progress tracker.
         from .prefill_progress import get_prefill_tracker
@@ -3114,6 +3982,14 @@ class Scheduler:
             # Remove from BatchGenerator to free internal KV cache
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
+                # Synchronize in-flight GPU work before modifying batch state.
+                # batch_generator.remove() triggers lazy KV cache array slicing
+                # (BatchKVCache.filter) that replaces references to arrays still
+                # used by in-flight Metal command buffers from the previous
+                # batch_generator.next() call.  Without this barrier the Metal
+                # driver can hit 'completeMemory() prepare count underflow'.
+                # (Mirrors the fix in _do_abort_request, commit 634603f)
+                mx.synchronize(generation_stream)
                 self._remove_uid_from_active_batch(uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
@@ -3149,6 +4025,18 @@ class Scheduler:
         # Update stop tokens after cleaning up finished requests
         if finished_ids:
             self._update_stop_tokens()
+            # Schedule deferred Metal cache cleanup instead of clearing immediately.
+            # Immediate mx.clear_cache() after request completion races with IOKit's
+            # asynchronous completeMemory() callbacks — the kernel-level GPU memory
+            # reference counting can still be in-flight even after mx.synchronize()
+            # returns, causing 'prepare count underflow' kernel panics (#435).
+            # Deferring by _DEFERRED_CLEAR_DELAY generation steps (~10-40 ms) gives
+            # IOKit time to process callbacks while still reclaiming buffers fast
+            # enough to prevent TTFT spikes from pool bloat (#411).
+            # Only set if not already pending — otherwise burst completions
+            # would keep resetting the counter and indefinitely postpone clearing.
+            if self._deferred_clear_steps is None:
+                self._deferred_clear_steps = 0
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
@@ -3179,6 +4067,9 @@ class Scheduler:
         # Clear UID mappings
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+
+        # Cancel any pending deferred Metal cache clear
+        self._deferred_clear_steps = None
 
         # Clear detokenizer state to prevent contamination after recovery
         self._request_detokenizers.clear()
@@ -3273,9 +4164,12 @@ class Scheduler:
 
         try:
             # Schedule waiting requests
-            scheduled = self._schedule_waiting()
+            scheduled, rejected = self._schedule_waiting()
             output.scheduled_request_ids = [r.request_id for r in scheduled]
             output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
+            if rejected:
+                output.outputs.extend(rejected)
+                output.has_work = True
 
             # Run generation step if we have running requests
             if self.batch_generator is not None and self.running:
@@ -3349,11 +4243,22 @@ class Scheduler:
 
         # Periodic Metal cache cleanup
         self._step_counter += 1
+        should_clear = False
         if (
             self.config.mlx_cache_cleanup_interval > 0
             and self._step_counter % self.config.mlx_cache_cleanup_interval == 0
         ):
-            mx.clear_cache()
+            should_clear = True
+        # Deferred post-completion cleanup: wait _DEFERRED_CLEAR_DELAY steps
+        # after the last request completion to give IOKit time to process
+        # completeMemory() callbacks before releasing Metal buffers (#435).
+        if self._deferred_clear_steps is not None:
+            self._deferred_clear_steps += 1
+            if self._deferred_clear_steps >= self._DEFERRED_CLEAR_DELAY:
+                should_clear = True
+                self._deferred_clear_steps = None
+        if should_clear:
+            _sync_and_clear_cache()
         if (
             self.config.gc_cleanup_interval > 0
             and self._step_counter % self.config.gc_cleanup_interval == 0
@@ -3421,6 +4326,9 @@ class Scheduler:
 
         # Clear Harmony parsers
         self._harmony_parsers.clear()
+
+        # Cancel any pending deferred Metal cache clear
+        self._deferred_clear_steps = None
 
     def deep_reset(self) -> None:
         """
@@ -3509,11 +4417,31 @@ class Scheduler:
             # Determine dtype size
             dtype_size = 2  # Default float16
             if hasattr(self.model, 'dtype'):
-                import mlx.core as mx
                 if self.model.dtype == mx.float32:
                     dtype_size = 4
                 elif self.model.dtype == mx.bfloat16:
                     dtype_size = 2
+
+            # Extract num_attention_heads (query heads) for SDPA peak estimation
+            num_attention_heads = (
+                getattr(config, 'num_attention_heads', None)
+                or getattr(config, 'n_head', None)
+                or num_kv_heads
+            )
+
+            # Count KVCache layers for hybrid models
+            num_kv_cache_layers = num_layers
+            if hasattr(self.model, 'make_cache'):
+                try:
+                    cache_list = self.model.make_cache()
+                    from mlx_lm.models.cache import KVCache
+                    num_kv_cache_layers = sum(
+                        1 for c in cache_list if type(c) is KVCache
+                    )
+                    if num_kv_cache_layers == 0:
+                        num_kv_cache_layers = num_layers  # fallback
+                except Exception:
+                    pass
 
             if num_layers and num_kv_heads and head_dim:
                 self.memory_monitor.set_model_info(
@@ -3521,10 +4449,13 @@ class Scheduler:
                     num_kv_heads=num_kv_heads,
                     head_dim=head_dim,
                     dtype_size=dtype_size,
+                    num_attention_heads=num_attention_heads,
+                    num_kv_cache_layers=num_kv_cache_layers,
                 )
                 logger.debug(
                     f"Model info for memory estimation: "
-                    f"layers={num_layers}, kv_heads={num_kv_heads}, "
+                    f"layers={num_layers} ({num_kv_cache_layers} KVCache), "
+                    f"kv_heads={num_kv_heads}, q_heads={num_attention_heads}, "
                     f"head_dim={head_dim}, dtype_size={dtype_size}"
                 )
             else:
@@ -3775,7 +4706,7 @@ class Scheduler:
         return verified
 
     def get_ssd_cache_stats(self) -> Optional[Dict[str, Any]]:
-        """Get paged SSD cache statistics."""
+        """Get paged SSD + prefix cache observability statistics."""
         stats = {}
 
         if self.paged_ssd_cache_manager is not None:
@@ -3785,6 +4716,11 @@ class Scheduler:
             # In paged SSD-only mode, all cache data is on paged SSD
             stats["indexed_blocks"] = self.paged_cache_manager.cold_block_count
             stats["block_size"] = self.config.paged_cache_block_size
+
+        if self.block_aware_cache is not None:
+            # Expose prefix-cache observability so UI can distinguish
+            # "0 indexed blocks" from "sub-block cached (<block_size)".
+            stats["prefix_cache"] = self.block_aware_cache.get_stats_dict()
 
         return stats if stats else None
 

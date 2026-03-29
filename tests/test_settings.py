@@ -605,17 +605,32 @@ class TestMemorySettings:
         """Test serialization."""
         settings = MemorySettings(max_process_memory="75%")
         d = settings.to_dict()
-        assert d == {"max_process_memory": "75%"}
+        assert d == {"max_process_memory": "75%", "prefill_memory_guard": True}
+
+    def test_to_dict_guard_disabled(self):
+        """Test serialization with prefill guard disabled."""
+        settings = MemorySettings(
+            max_process_memory="75%", prefill_memory_guard=False
+        )
+        d = settings.to_dict()
+        assert d["prefill_memory_guard"] is False
 
     def test_from_dict(self):
         """Test deserialization."""
         settings = MemorySettings.from_dict({"max_process_memory": "90%"})
         assert settings.max_process_memory == "90%"
+        assert settings.prefill_memory_guard is True  # default
 
     def test_from_dict_defaults(self):
         """Test deserialization with empty dict uses defaults."""
         settings = MemorySettings.from_dict({})
         assert settings.max_process_memory == "auto"
+        assert settings.prefill_memory_guard is True
+
+    def test_from_dict_guard_disabled(self):
+        """Test deserialization with prefill guard disabled."""
+        settings = MemorySettings.from_dict({"prefill_memory_guard": False})
+        assert settings.prefill_memory_guard is False
 
 
 class TestGlobalSettings:
@@ -811,6 +826,24 @@ class TestGlobalSettings:
             assert custom_models.exists()
             assert custom_cache.exists()
             assert custom_logs.exists()
+
+    def test_ensure_directories_unavailable_model_dir(self):
+        """Test that unavailable model dirs are skipped instead of crashing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / "omlx"
+            valid_models = Path(tmpdir) / "valid_models"
+            unavailable = Path("/Volumes/NonExistentDrive/Models")
+
+            settings = GlobalSettings(base_path=base)
+            settings.model.model_dirs = [str(valid_models), str(unavailable)]
+            settings.ensure_directories()
+
+            assert base.exists()
+            assert valid_models.exists()
+            # Unavailable path should be removed from model_dirs
+            resolved_dirs = settings.model.get_model_dirs(base)
+            assert len(resolved_dirs) == 1
+            assert resolved_dirs[0] == valid_models.resolve()
 
     def test_validate_valid_settings(self):
         """Test validation with valid settings."""

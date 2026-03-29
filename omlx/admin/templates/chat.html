@@ -4,6 +4,7 @@
 
 {% block head %}
 <!-- Markdown rendering -->
+<script src="/admin/static/js/purify.min.js"></script>
 <script src="/admin/static/js/marked.umd.js"></script>
 <script src="/admin/static/js/marked-highlight.umd.js"></script>
 
@@ -266,6 +267,65 @@
         .sidebar-overlay.hidden { display: none; }
         .user-edit-btn { left: -28px; }
     }
+
+    /* Image modal */
+    .image-modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.9);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+        cursor: zoom-out;
+    }
+    .image-modal img {
+        max-width: 90%;
+        max-height: 90%;
+        object-fit: contain;
+        border-radius: 8px;
+        box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+    }
+    .image-modal-close {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        width: 40px;
+        height: 40px;
+        background: rgba(255, 255, 255, 0.1);
+        border: none;
+        border-radius: 50%;
+        color: white;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.2s;
+    }
+    .image-modal-close:hover {
+        background: rgba(255, 255, 255, 0.2);
+    }
+
+    /* Edit image preview */
+    .edit-images-preview {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 8px;
+        padding: 8px;
+        background: var(--bg-tertiary);
+        border-radius: 8px;
+    }
+    .edit-images-preview .edit-image-item {
+        position: relative;
+    }
+    .edit-images-preview img {
+        width: 64px;
+        height: 64px;
+        object-fit: cover;
+        border-radius: 6px;
+        border: 1px solid var(--border-faint);
+    }
 </style>
 {% endblock %}
 
@@ -400,7 +460,14 @@
                 </div>
             </div>
 
-            <div class="w-10"></div>
+            <button @click="systemPromptDraft = systemPrompt; showSystemPromptModal = true"
+                    class="p-2 hover:bg-surface-muted rounded-lg relative"
+                    style="color: var(--text-primary);"
+                    :title="window.t('chat.system_prompt.title')">
+                <i data-lucide="settings" class="w-5 h-5"></i>
+                <span x-show="systemPrompt.trim()" x-cloak
+                      class="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full"></span>
+            </button>
         </header>
 
         <!-- Messages Area -->
@@ -437,7 +504,7 @@
                                         <template x-if="getImageUrls(msg.content).length > 0">
                                             <div class="flex flex-wrap gap-2 mb-2">
                                                 <template x-for="imgUrl in getImageUrls(msg.content)" :key="imgUrl.substring(0, 50)">
-                                                    <img :src="imgUrl" @click="window.open(imgUrl, '_blank')" class="max-w-48 max-h-48 object-cover rounded-lg cursor-pointer">
+                                                    <img :src="imgUrl" @click="openImageModal(imgUrl)" class="max-w-48 max-h-48 object-cover rounded-lg cursor-pointer">
                                                 </template>
                                             </div>
                                         </template>
@@ -460,6 +527,14 @@
                                 </template>
                                 <template x-if="editingIndex === index">
                                     <div class="user-message-bubble" style="padding: 0; background: transparent;">
+                                        <!-- Show preserved images during edit -->
+                                        <div x-show="editImages.length > 0" class="edit-images-preview">
+                                            <template x-for="(img, idx) in editImages" :key="img.substring(0, 50)">
+                                                <div class="edit-image-item">
+                                                    <img :src="img" :alt="window.t('chat.image_preview') || 'Image'">
+                                                </div>
+                                            </template>
+                                        </div>
                                         <textarea
                                             x-model="editContent"
                                             @keydown.enter.ctrl="saveEdit(index)"
@@ -586,6 +661,61 @@
             </div>
         </div>
     </div>
+
+    <!-- Image Modal -->
+    <div x-show="imageModal.show" x-cloak
+         class="image-modal"
+         @click="closeImageModal()"
+         @keydown.escape.window="closeImageModal()">
+        <button class="image-modal-close" @click="closeImageModal()">
+            <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+        <img :src="imageModal.src" @click.stop alt="Preview" x-show="imageModal.src">
+    </div>
+
+    <!-- System Prompt Modal -->
+    <div x-show="showSystemPromptModal" x-cloak
+         class="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
+         @click="showSystemPromptModal = false"
+         @keydown.escape.window="showSystemPromptModal = false">
+        <div class="bg-surface rounded-2xl p-6 max-w-[500px] w-[90%] shadow-2xl" @click.stop>
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-bold" style="color: var(--text-primary);">
+                    {{ t('chat.system_prompt.title') }}
+                </h3>
+                <button @click="showSystemPromptModal = false" class="p-1 hover:bg-surface-muted rounded-lg" style="color: var(--text-tertiary);">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+            <p class="text-sm mb-3" style="color: var(--text-tertiary);">
+                {{ t('chat.system_prompt.description') }}
+            </p>
+            <textarea x-model="systemPromptDraft" rows="6"
+                      :placeholder="window.t('chat.system_prompt.placeholder')"
+                      class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong resize-y"
+                      style="background: var(--bg-primary); color: var(--text-primary);"
+            ></textarea>
+            <div class="flex items-center justify-between">
+                <button @click="systemPromptDraft = ''; systemPrompt = ''; localStorage.removeItem('omlx_chat_system_prompt'); showSystemPromptModal = false"
+                        class="text-sm px-3 py-2 hover:bg-surface-muted rounded-lg"
+                        style="color: var(--text-tertiary);"
+                        x-show="systemPrompt.trim()">
+                    {{ t('chat.system_prompt.clear') }}
+                </button>
+                <div class="flex items-center gap-2 ml-auto">
+                    <button @click="showSystemPromptModal = false"
+                            class="px-4 py-2 text-sm rounded-xl hover:bg-surface-muted"
+                            style="color: var(--text-primary);">
+                        {{ t('chat.system_prompt.cancel') }}
+                    </button>
+                    <button @click="systemPrompt = systemPromptDraft; localStorage.setItem('omlx_chat_system_prompt', systemPrompt); showSystemPromptModal = false"
+                            class="px-4 py-2 text-sm bg-accent text-accent-fg rounded-xl hover:bg-accent-hover">
+                        {{ t('chat.system_prompt.save') }}
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 {% endblock %}
 
@@ -652,13 +782,25 @@
             // Edit State
             editingIndex: null,
             editContent: '',
+            editImages: [],              // Preserve images during edit
 
             // Image Upload State
             uploadImages: [],            // Array of { id, base64 } for pending images (max 10)
             isDragOver: false,           // drag-and-drop state
 
+            // Image Modal State
+            imageModal: {
+                show: false,
+                src: ''
+            },
+
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
+
+            // System Prompt
+            systemPrompt: localStorage.getItem('omlx_chat_system_prompt') || '',
+            showSystemPromptModal: false,
+            systemPromptDraft: '',
 
             async init() {
                 // Auto-inject API key from server (admin session already authenticated)
@@ -678,15 +820,6 @@
                 // Apply theme
                 this.applyTheme();
 
-                // Watch messages array and reinitialize Lucide icons when it changes
-                this.$watch('messages', () => {
-                    this.$nextTick(() => lucide.createIcons());
-                });
-
-                // Watch chatHistory for sidebar icons
-                this.$watch('chatHistory', () => {
-                    this.$nextTick(() => lucide.createIcons());
-                });
 
                 // Setup scroll listener for auto-scroll management
                 this.$nextTick(() => {
@@ -716,6 +849,17 @@
 
             hasVisionSupport() {
                 return this.modelTypeMap[this.currentModel] === 'vlm';
+            },
+
+            // ===== Image Modal Functions =====
+
+            openImageModal(url) {
+                if (!url) return;
+                this.imageModal = { show: true, src: url };
+            },
+
+            closeImageModal() {
+                this.imageModal = { show: false, src: '' };
             },
 
             // ===== Image Upload Functions =====
@@ -755,7 +899,6 @@
                         id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
                         base64: e.target.result
                     });
-                    this.$nextTick(() => lucide.createIcons());
                 };
                 reader.onerror = () => {
                     alert(window.t('chat.error.image_load_failed'));
@@ -890,7 +1033,16 @@
                     }
 
                     const modelsData = await modelsResponse.json();
-                    this.availableModels = modelsData.data || [];
+                    const allModels = modelsData.data || [];
+
+                    // Fetch model types first (needed for filtering and VLM detection)
+                    await this.fetchModelTypes();
+
+                    // Filter out audio/embedding/reranker — chat only works with LLM/VLM
+                    this.availableModels = allModels.filter(m => {
+                        const t = (this.modelTypeMap[m.id] || '').toLowerCase();
+                        return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
+                    });
 
                     // Get default model from health endpoint
                     let defaultModel = null;
@@ -907,8 +1059,6 @@
                             this.currentModel = this.availableModels[0].id;
                         }
                     }
-                    // Fetch model types for VLM detection
-                    await this.fetchModelTypes();
                 } catch (error) {
                     console.error('Error loading models:', error);
                 }
@@ -937,6 +1087,7 @@
                 this.currentChatId = 'chat_' + Date.now();
                 this.messages = [];
                 this.uploadImages = [];
+                this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
                 this.sidebarOpen = window.innerWidth >= 768;
             },
 
@@ -945,6 +1096,7 @@
                 if (chat) {
                     this.currentChatId = chatId;
                     this.messages = chat.messages || [];
+                    this.systemPrompt = chat.systemPrompt || '';
                     if (chat.model) {
                         this.currentModel = chat.model;
                     }
@@ -979,6 +1131,7 @@
                     title,
                     messages: messagesForStorage,
                     model: this.currentModel,
+                    systemPrompt: this.systemPrompt,
                     updatedAt: new Date().toISOString()
                 };
 
@@ -1038,6 +1191,14 @@
                     role: msg.role,
                     content: msg.content
                 }));
+
+                // Prepend system prompt if set
+                if (this.systemPrompt.trim()) {
+                    messagesForApi.unshift({
+                        role: 'system',
+                        content: this.systemPrompt.trim()
+                    });
+                }
 
                 try {
                     const response = await fetch('/v1/chat/completions', {
@@ -1153,7 +1314,6 @@
                     this.streamingContent = '';
                     this.abortController = null;
                     this.thinkingAutoScroll = true; // Reset thinking scroll state
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -1216,13 +1376,14 @@
                 if (this.isStreaming || this.editingIndex !== null) return;
                 this.editingIndex = index;
                 this.editContent = this.getTextContent(this.messages[index].content);
-                this.$nextTick(() => lucide.createIcons());
+                // Preserve images from the original message
+                this.editImages = this.getImageUrls(this.messages[index].content);
             },
 
             cancelEdit() {
                 this.editingIndex = null;
                 this.editContent = '';
-                this.$nextTick(() => lucide.createIcons());
+                this.editImages = [];
             },
 
             async saveEdit(index) {
@@ -1233,15 +1394,28 @@
                 // Remove all messages from this index onwards
                 this.messages = this.messages.slice(0, index);
 
+                // Build message content, preserving images
+                let content;
+                if (this.editImages.length > 0) {
+                    content = [];
+                    for (const img of this.editImages) {
+                        content.push({ type: 'image_url', image_url: { url: img } });
+                    }
+                    content.push({ type: 'text', text: newContent });
+                } else {
+                    content = newContent;
+                }
+
                 // Add edited user message
                 this.messages.push({
                     role: 'user',
-                    content: newContent
+                    content
                 });
 
                 // Reset edit state
                 this.editingIndex = null;
                 this.editContent = '';
+                this.editImages = [];
 
                 // Scroll and get new response
                 this.scrollToBottom();
@@ -1260,7 +1434,6 @@
                     this.startNewChat();
                 }
 
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // Clear all history
@@ -1271,7 +1444,6 @@
                 this.saveChatHistory();
                 this.startNewChat();
 
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // Thinking/Reasoning tag processing
@@ -1339,8 +1511,8 @@
                     // Extract thinking blocks first
                     const { thinkingBlocks, cleanText } = this.extractThinking(text);
 
-                    // Parse clean text with marked
-                    let html = marked.parse(cleanText);
+                    // Parse clean text with marked and sanitize
+                    let html = DOMPurify.sanitize(marked.parse(cleanText));
 
                     // Add thinking blocks at the beginning if they exist
                     if (thinkingBlocks.length > 0) {
@@ -1379,7 +1551,7 @@
                     while ((match = completeThinkRegex.exec(text)) !== null) {
                         const beforeContent = text.substring(lastIndex, match.index);
                         if (beforeContent.trim()) {
-                            html += marked.parse(beforeContent);
+                            html += DOMPurify.sanitize(marked.parse(beforeContent));
                         }
                         const elapsed = match[2] ? parseInt(match[2]) : null;
                         html += this.renderThinkingBlock(match[1].trim(), blockIndex++, 'streaming', elapsed);
@@ -1392,7 +1564,7 @@
                     if (incompleteThinkIndex !== -1) {
                         const beforeIncomplete = remaining.substring(0, incompleteThinkIndex);
                         if (beforeIncomplete.trim()) {
-                            html += marked.parse(beforeIncomplete);
+                            html += DOMPurify.sanitize(marked.parse(beforeIncomplete));
                         }
 
                         const thinkingContent = remaining.substring(incompleteThinkIndex + 7);
@@ -1412,7 +1584,7 @@
                             </div>
                         `;
                     } else if (remaining.trim()) {
-                        html += marked.parse(remaining);
+                        html += DOMPurify.sanitize(marked.parse(remaining));
                     }
 
                     return html;
@@ -1608,7 +1780,6 @@
                 this.theme = this.theme === 'light' ? 'dark' : 'light';
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTheme() {

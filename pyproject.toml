@@ -28,13 +28,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.29.2",
-    # mlx-lm from latest commit (4a21ffd)
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4a21ffd",
-    # mlx-embeddings from latest commit (88522e2)
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@88522e288c0142170a5a44fd93c184d8ed777371",
+    "mlx>=0.31.1",
+    # mlx-lm from latest commit (564281f)
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+    # mlx-embeddings from latest commit (32981fa)
+    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # transformers version aligned with mlx-lm requirement
-    "transformers>=5.0.0",
+    # 5.4.0 broke VLM: Qwen2VLImageProcessor now hard-requires torch (#431)
+    "transformers>=5.0.0,<5.4.0",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",
@@ -52,15 +53,17 @@ dependencies = [
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
-    "fastapi>=0.100.0",
+    "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (348466f)
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@348466f3f8f9a0413a6167bf8c1634d02ca2c131",
+    # mlx-vlm from commit (7f7a04c)
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
     "Pillow>=9.0.0",
+    # Grammar-constrained decoding for structured output
+    "xgrammar>=0.1.32",
 ]
 
 [project.optional-dependencies]
@@ -70,6 +73,11 @@ mcp = [
 modelscope = [
     "modelscope>=1.10.0",
 ]
+audio = [
+    # mlx-audio from commit (6408d2a)
+    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250",
+    "python-multipart>=0.0.5",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -78,6 +86,19 @@ dev = [
     "mypy>=1.0.0",
     "mcp>=1.0.0",
 ]
+# PEP 735 dependency groups — consumed by `uv sync --dev`.
+# Keep in sync with [project.optional-dependencies] dev above
+# (pip/legacy toolchains use that section instead).
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "mcp>=1.0.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/jundot/omlx"
 Documentation = "https://github.com/jundot/omlx#readme"
@@ -94,7 +115,9 @@ where = ["."]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
+"omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
+"omlx.eval" = ["data/*.jsonl"]
 
 [tool.black]
 line-length = 88

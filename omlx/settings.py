@@ -298,6 +298,7 @@ class MemorySettings:
     """Process-level memory enforcement settings."""
 
     max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
+    prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
 
     def get_max_process_memory_bytes(self) -> int | None:
         """
@@ -332,13 +333,17 @@ class MemorySettings:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"max_process_memory": self.max_process_memory}
+        return {
+            "max_process_memory": self.max_process_memory,
+            "prefill_memory_guard": self.prefill_memory_guard,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MemorySettings:
         """Create from dictionary."""
         return cls(
             max_process_memory=data.get("max_process_memory", "auto"),
+            prefill_memory_guard=data.get("prefill_memory_guard", True),
         )
 
 
@@ -905,14 +910,14 @@ class GlobalSettings:
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""
-        directories = [
+        # Required directories - fatal if creation fails
+        required = [
             self.base_path,
-            *self.model.get_model_dirs(self.base_path),
             self.cache.get_ssd_cache_dir(self.base_path),
             self.logging.get_log_dir(self.base_path),
         ]
 
-        for directory in directories:
+        for directory in required:
             if not directory.exists():
                 try:
                     directory.mkdir(parents=True, exist_ok=True)
@@ -920,6 +925,25 @@ class GlobalSettings:
                 except OSError as e:
                     logger.error(f"Failed to create directory {directory}: {e}")
                     raise
+
+        # Model directories - skip unavailable paths (e.g. disconnected external drive)
+        valid_dirs = []
+        for directory in self.model.get_model_dirs(self.base_path):
+            if directory.exists():
+                valid_dirs.append(str(directory))
+                continue
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                logger.debug(f"Created directory: {directory}")
+                valid_dirs.append(str(directory))
+            except OSError as e:
+                logger.warning(
+                    f"Model directory unavailable, skipping: {directory} ({e})"
+                )
+
+        # Update model_dirs to only include valid paths
+        self.model.model_dirs = valid_dirs
+        self.model.model_dir = None
 
     def validate(self) -> list[str]:
         """

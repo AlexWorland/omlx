@@ -52,6 +52,18 @@ class TestMCPClientInit:
         assert client.name == "sse-server"
         assert client.config.url == "http://localhost:3000/mcp"
 
+    def test_client_init_streamable_http(self):
+        """Test client initialization with streamable_http config."""
+        config = MCPServerConfig(
+            name="streamable-server",
+            transport=MCPTransport.STREAMABLE_HTTP,
+            url="http://localhost:3000/mcp",
+        )
+        client = MCPClient(config)
+
+        assert client.name == "streamable-server"
+        assert client.config.url == "http://localhost:3000/mcp"
+
 
 class TestMCPClientProperties:
     """Tests for MCPClient properties."""
@@ -183,6 +195,16 @@ class TestMCPClientConnect:
         )
         return MCPClient(config)
 
+    @pytest.fixture
+    def streamable_http_client(self) -> MCPClient:
+        """Create a streamable_http client for testing."""
+        config = MCPServerConfig(
+            name="streamable-http-test",
+            transport=MCPTransport.STREAMABLE_HTTP,
+            url="http://localhost:3000/mcp",
+        )
+        return MCPClient(config)
+
     @pytest.mark.asyncio
     async def test_connect_already_connected(self, stdio_client: MCPClient):
         """Test connect returns True when already connected."""
@@ -238,6 +260,31 @@ class TestMCPClientConnect:
 
         assert result is True
         assert sse_client.state == MCPServerState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_connect_streamable_http_success(
+        self, streamable_http_client: MCPClient
+    ):
+        """Test successful streamable_http connection."""
+        with (
+            patch.object(
+                streamable_http_client,
+                "_connect_streamable_http",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                streamable_http_client, "_initialize_session", new_callable=AsyncMock
+            ),
+            patch.object(
+                streamable_http_client, "_discover_tools", new_callable=AsyncMock
+            ),
+        ):
+            streamable_http_client._session = MagicMock()
+
+            result = await streamable_http_client.connect()
+
+        assert result is True
+        assert streamable_http_client.state == MCPServerState.CONNECTED
 
     @pytest.mark.asyncio
     async def test_connect_failure(self, stdio_client: MCPClient):
@@ -349,6 +396,91 @@ class TestMCPClientDisconnect:
 
         mock_sse.__aexit__.assert_called_once()
         assert client._sse_client is None
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cleans_streamable_http_client(self):
+        """Test disconnect cleans up streamable_http client."""
+        config = MCPServerConfig(
+            name="streamable-http",
+            transport=MCPTransport.STREAMABLE_HTTP,
+            url="http://test.com",
+        )
+        client = MCPClient(config)
+        client._state = MCPServerState.CONNECTED
+        client._session = AsyncMock()
+        mock_streamable_http = AsyncMock()
+        mock_http_client = AsyncMock()
+        client._streamable_http_client = mock_streamable_http
+        client._http_client = mock_http_client
+
+        await client.disconnect()
+
+        mock_streamable_http.__aexit__.assert_called_once()
+        mock_http_client.__aexit__.assert_called_once()
+        assert client._streamable_http_client is None
+        assert client._http_client is None
+
+    @pytest.mark.asyncio
+    async def test_connect_failure_cleans_up_resources(self):
+        """Test that connect() cleans up partial resources on failure."""
+        config = MCPServerConfig(
+            name="cleanup-test",
+            transport=MCPTransport.STDIO,
+            command="python",
+        )
+        client = MCPClient(config)
+
+        mock_stdio = AsyncMock()
+
+        with (
+            patch.object(client, "_connect_stdio", new_callable=AsyncMock) as mock_connect,
+            patch.object(client, "_initialize_session", new_callable=AsyncMock) as mock_init,
+        ):
+            async def setup_partial_resources():
+                client._stdio_client = mock_stdio
+                client._session = AsyncMock()
+
+            mock_connect.side_effect = setup_partial_resources
+            mock_init.side_effect = RuntimeError("Init failed")
+
+            result = await client.connect()
+
+        assert result is False
+        assert client.state == MCPServerState.ERROR
+        # Partial resources should be cleaned up
+        assert client._session is None
+
+    @pytest.mark.asyncio
+    async def test_streamable_http_partial_connect_cleanup(self):
+        """Test streamable-http cleans up http_client on session failure."""
+        config = MCPServerConfig(
+            name="partial-cleanup",
+            transport=MCPTransport.STREAMABLE_HTTP,
+            url="http://localhost:3000/mcp",
+        )
+        client = MCPClient(config)
+
+        mock_http_client = AsyncMock()
+        mock_streamable = AsyncMock()
+
+        with (
+            patch("omlx.mcp.client.MCPClient._connect_streamable_http") as mock_connect,
+            patch.object(client, "_initialize_session", new_callable=AsyncMock) as mock_init,
+        ):
+            async def setup_and_fail():
+                client._http_client = mock_http_client
+                client._streamable_http_client = mock_streamable
+                client._session = AsyncMock()
+                raise RuntimeError("Connection failed midway")
+
+            mock_connect.side_effect = setup_and_fail
+
+            result = await client.connect()
+
+        assert result is False
+        # Resources should be cleaned up via _cleanup_resources
+        assert client._http_client is None
+        assert client._streamable_http_client is None
 
 
 class TestMCPClientCallTool:

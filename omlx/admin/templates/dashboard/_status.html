@@ -1,12 +1,12 @@
             <div x-show="mainTab === 'status'" x-cloak>
                 <div class="animate-fade-in-up">
                     <!-- Serving Stats Header -->
-                    <div class="flex items-end justify-between mb-8">
+                    <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-8">
                         <div>
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('status.section_label') }}</h2>
                             <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('status.heading') }}</h3>
                         </div>
-                        <div class="flex items-center gap-2">
+                        <div class="flex flex-wrap items-center gap-2">
                             <!-- Scope toggle -->
                             <div class="flex rounded-lg border border-neutral-200 overflow-hidden">
                                 <button @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
@@ -54,9 +54,9 @@
                     </div>
 
                     <!-- Three Stat Cards -->
-                    <div class="grid grid-cols-3 gap-6 mb-8">
-                        <!-- Total Tokens Served -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
+                        <!-- Total Prefill Tokens -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
                                :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"
@@ -64,7 +64,7 @@
                         </div>
 
                         <!-- Cached Tokens Served -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cached_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
                                :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"
@@ -72,7 +72,7 @@
                         </div>
 
                         <!-- Cache Efficiency -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cache_efficiency') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
                                :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency)"
@@ -88,7 +88,7 @@
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.speed.section_label') }}</span>
                             </div>
                         </div>
-                        <div class="grid grid-cols-2 divide-x divide-neutral-100">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 sm:divide-x divide-neutral-100">
                             <div class="p-6">
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.prompt_processing') }} <span class="text-neutral-400">{{ t('status.speed.prompt_processing_note') }}</span></p>
                                 <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
@@ -101,8 +101,8 @@
                     </div>
 
                     <!-- Active Models -->
-                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
-                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                    <div class="bg-white rounded-2xl border border-neutral-200 mb-8">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
@@ -202,6 +202,18 @@
                                             </template>
                                         </div>
                                     </template>
+                                    <!-- Generating sub-rows -->
+                                    <template x-if="m.generating && m.generating.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="gen in m.generating" :key="gen.request_id">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
+                                                    <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+                                                    <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
                                 </div>
                             </template>
                         </div>
@@ -221,6 +233,102 @@
                         </div>
                     </div>
 
+                    <!-- Runtime Cache Observability -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="database" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Runtime Cache Observability</span>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <span class="text-xs text-neutral-500"
+                                      x-text="formatNumber((stats.runtime_cache?.total_num_files || 0)) + ' files · ' + formatSizeBytes((stats.runtime_cache?.total_size_bytes || 0))"></span>
+                                <div class="flex items-center gap-1.5">
+                                    <button x-show="!showClearSsdCacheConfirm && (stats.runtime_cache?.total_num_files || 0) > 0"
+                                            @click="showClearSsdCacheConfirm = true"
+                                            class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                            :title="window.t('status.clear_ssd_cache_tooltip')">
+                                        <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                    </button>
+                                    <div x-show="showClearSsdCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                        <span class="text-xs text-red-600" x-text="window.t('status.clear_ssd_cache_confirm')"></span>
+                                        <button @click="clearSsdCache()"
+                                                class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                            {{ t('status.clear_yes') }}
+                                        </button>
+                                        <button @click="showClearSsdCacheConfirm = false"
+                                                class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                            {{ t('status.clear_cancel') }}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="px-6 py-4 space-y-3">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                                <div>
+                                    <div class="text-neutral-400 mb-1">Active base_path</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
+                                          x-text="stats.runtime_cache?.base_path || '-' "></code>
+                                </div>
+                                <div>
+                                    <div class="text-neutral-400 mb-1">Effective ssd_cache_dir</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
+                                          x-text="stats.runtime_cache?.ssd_cache_dir || '-' "></code>
+                                </div>
+                            </div>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                                <div>
+                                    <div class="text-neutral-400 mb-1">response-state directory</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
+                                          x-text="stats.runtime_cache?.response_state_dir || '-' "></code>
+                                </div>
+                            </div>
+
+                            <div x-show="stats.runtime_cache?.models && stats.runtime_cache.models.length > 0" x-cloak
+                                 class="overflow-x-auto border border-neutral-100 rounded-lg">
+                                <table class="min-w-full text-xs">
+                                    <thead class="bg-neutral-50 text-neutral-500 uppercase tracking-wider">
+                                        <tr>
+                                            <th class="px-3 py-2 text-left">Model</th>
+                                            <th class="px-3 py-2 text-right">Block Size</th>
+                                            <th class="px-3 py-2 text-right">Indexed Blocks</th>
+                                            <th class="px-3 py-2 text-right">Sub-block Cache</th>
+                                            <th class="px-3 py-2 text-right">Cache Files</th>
+                                            <th class="px-3 py-2 text-right">Cache Size</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-neutral-100 text-neutral-700">
+                                        <template x-for="m in stats.runtime_cache.models" :key="m.id">
+                                            <tr>
+                                                <td class="px-3 py-2 font-medium" x-text="m.id"></td>
+                                                <td class="px-3 py-2 text-right" x-text="m.block_size ? (m.block_size + ' tks') : '-' "></td>
+                                                <td class="px-3 py-2 text-right">
+                                                    <span x-show="!m.has_sub_block_cache" x-text="formatNumber(m.indexed_blocks || 0) + ' blocks'"></span>
+                                                    <span x-show="m.has_sub_block_cache" class="font-medium text-amber-600" x-text="m.indexed_blocks_display + ' tks'"></span>
+                                                </td>
+                                                <td class="px-3 py-2 text-right">
+                                                    <span x-show="m.has_sub_block_cache"
+                                                          class="text-amber-600"
+                                                          x-text="'cached (' + (m.last_partial_tokens_skipped || m.indexed_blocks_display || ('<' + (m.block_size || '?'))) + ' tokens)'">
+                                                    </span>
+                                                    <span x-show="!m.has_sub_block_cache" class="text-neutral-400">-</span>
+                                                </td>
+                                                <td class="px-3 py-2 text-right" x-text="formatNumber(m.num_files || 0)"></td>
+                                                <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div class="text-[11px] text-neutral-500">
+                                Note: <span class="font-medium text-amber-600">Sub-block Cache</span> means requests below one full block (for example &lt;1024 tokens on some models) are cached in memory/paged cache but are not counted as indexed SSD blocks.
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- API Endpoints -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -230,7 +338,7 @@
                             </div>
                         </div>
                         <div class="divide-y divide-neutral-100">
-                            <div class="flex items-center justify-between px-6 py-4">
+                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                 <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.openai') }}</label>
                                 <div class="flex items-center gap-2">
                                     <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
@@ -245,7 +353,7 @@
                                     </button>
                                 </div>
                             </div>
-                            <div class="flex items-center justify-between px-6 py-4">
+                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                 <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.claude') }}</label>
                                 <div class="flex items-center gap-2">
                                     <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
@@ -272,9 +380,9 @@
                             </div>
                         </div>
                         <div class="px-6 py-5">
-                            <div class="flex gap-4 items-start">
+                            <div class="flex flex-col sm:flex-row gap-4 items-start">
                                 <!-- Left: Mode Toggle -->
-                                <div class="w-48 flex-shrink-0">
+                                <div class="w-full sm:w-48 sm:flex-shrink-0">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('status.claude_code.mode') }}</label>
                                     <div class="flex items-center gap-3">
                                         <button type="button"
@@ -314,7 +422,7 @@
                                     <i data-lucide="alert-triangle" class="w-3.5 h-3.5 flex-shrink-0"></i>
                                     <span>{{ t('status.claude_code.no_models_warning') }}</span>
                                 </div>
-                                <div class="grid grid-cols-3 gap-4">
+                                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                                     <!-- Opus tier -->
                                     <div>
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.opus_tier') }}</label>
@@ -375,7 +483,7 @@
 
                             <!-- Context Scaling for Claude Code -->
                             <div class="mt-4 pt-4 border-t border-neutral-100">
-                                <div class="flex gap-4 items-center">
+                                <div class="flex flex-col sm:flex-row gap-4 sm:items-center">
                                     <div class="flex items-center gap-3">
                                         <label class="text-xs font-bold uppercase tracking-wider text-neutral-500">{{ t('status.claude_code.context_scaling') }}</label>
                                         <button type="button"
@@ -417,8 +525,8 @@
                                     <span class="text-base font-bold text-neutral-800">Codex</span>
                                     <span class="text-xs text-neutral-400">OpenAI Codex CLI</span>
                                 </div>
-                                <div class="flex gap-4 items-start">
-                                    <div class="w-64 flex-shrink-0">
+                                <div class="flex flex-col sm:flex-row gap-4 items-start">
+                                    <div class="w-full sm:w-64 sm:flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
                                         <select x-model="globalSettings.integrations.codex_model"
                                                 @change="globalSettings.integrations.codex_model = globalSettings.integrations.codex_model || null; saveIntegrationSettings()"
@@ -461,8 +569,8 @@
                                     <span class="text-base font-bold text-neutral-800">OpenCode</span>
                                     <span class="text-xs text-neutral-400">{{ t('status.integrations.opencode_desc') }}</span>
                                 </div>
-                                <div class="flex gap-4 items-start">
-                                    <div class="w-64 flex-shrink-0">
+                                <div class="flex flex-col sm:flex-row gap-4 items-start">
+                                    <div class="w-full sm:w-64 sm:flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
                                         <select x-model="globalSettings.integrations.opencode_model"
                                                 @change="globalSettings.integrations.opencode_model = globalSettings.integrations.opencode_model || null; saveIntegrationSettings()"
@@ -505,8 +613,8 @@
                                     <span class="text-base font-bold text-neutral-800">OpenClaw</span>
                                     <span class="text-xs text-neutral-400">{{ t('status.integrations.openclaw_desc') }}</span>
                                 </div>
-                                <div class="flex gap-4 items-start">
-                                    <div class="w-48 flex-shrink-0">
+                                <div class="flex flex-col sm:flex-row gap-4 items-start">
+                                    <div class="w-full sm:w-48 sm:flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
                                         <select x-model="globalSettings.integrations.openclaw_model"
                                                 @change="globalSettings.integrations.openclaw_model = globalSettings.integrations.openclaw_model || null; saveIntegrationSettings()"
@@ -523,7 +631,7 @@
                                             <span>{{ t('status.integrations.model_unavailable') }}</span>
                                         </div>
                                     </div>
-                                    <div class="w-36 flex-shrink-0">
+                                    <div class="w-full sm:w-36 sm:flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.openclaw_tools_profile') }}</label>
                                         <select x-model="globalSettings.integrations.openclaw_tools_profile"
                                                 @change="saveIntegrationSettings()"

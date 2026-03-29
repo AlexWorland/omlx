@@ -12,7 +12,7 @@ These models define the request and response schemas for:
 
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from omlx.api.shared_models import (
     BaseUsage,
@@ -65,6 +65,10 @@ class Message(BaseModel):
     tool_calls: Optional[List[dict]] = None
     # For tool response messages (role="tool")
     tool_call_id: Optional[str] = None
+    # Participant name, rendered into chat template (e.g. Kimi K2/K2.5 named assistants)
+    name: Optional[str] = None
+    # Continue from this message instead of starting a new turn (prefill / partial mode)
+    partial: bool = False
 
 
 # =============================================================================
@@ -118,6 +122,26 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[ResponseFormatJsonSchema] = None
 
 
+class StructuredOutputOptions(BaseModel):
+    """vLLM-compatible structured output options.
+
+    Exactly one field should be set. When passed via ``extra_body`` in the
+    OpenAI client, the key is ``structured_outputs``.
+
+    Supports:
+    - json: JSON schema (dict or string) for logit-level enforcement
+    - regex: Regular expression the output must match
+    - choice: List of allowed string values (output will be exactly one)
+    - grammar: EBNF/GBNF context-free grammar string
+    """
+    model_config = {"populate_by_name": True}
+
+    json_schema: Optional[Union[str, dict]] = Field(None, alias="json")
+    regex: Optional[str] = None
+    choice: Optional[List[str]] = None
+    grammar: Optional[str] = None
+
+
 # =============================================================================
 # Chat Completion
 # =============================================================================
@@ -138,6 +162,8 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[StreamOptions] = None
     stop: Optional[List[str]] = None
     min_p: float | None = None
+    xtc_probability: float | None = None
+    xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
     # Tool calling
@@ -145,8 +171,26 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[Union[str, dict]] = None  # "auto", "none", or specific tool
     # Structured output
     response_format: Optional[Union[ResponseFormat, dict]] = None
+    # vLLM-compatible structured output (grammar, regex, choice, json)
+    structured_outputs: Optional[Union[StructuredOutputOptions, dict]] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Thinking budget (max thinking tokens, None = unlimited)
+    thinking_budget: Optional[int] = None
+    # SpecPrefill: per-request enable/disable (None = use model setting)
+    specprefill: Optional[bool] = None
+    # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
+    specprefill_keep_pct: Optional[float] = None
+    # SpecPrefill: per-request threshold override (min tokens to trigger, None = use model setting)
+    specprefill_threshold: Optional[int] = None
+
+    @field_validator("stop", mode="before")
+    @classmethod
+    def coerce_stop(cls, v):
+        """Accept stop as a single string (OpenAI compat) and wrap in a list."""
+        if isinstance(v, str):
+            return [v]
+        return v
 
 
 class AssistantMessage(BaseModel):
@@ -208,8 +252,18 @@ class CompletionRequest(BaseModel):
     stream_options: Optional[StreamOptions] = None
     stop: Optional[List[str]] = None
     min_p: float | None = None
+    xtc_probability: float | None = None
+    xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+
+    @field_validator("stop", mode="before")
+    @classmethod
+    def coerce_stop(cls, v):
+        """Accept stop as a single string (OpenAI compat) and wrap in a list."""
+        if isinstance(v, str):
+            return [v]
+        return v
 
 
 class CompletionChoice(BaseModel):

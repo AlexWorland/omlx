@@ -321,6 +321,26 @@ class TestChatCompletionRequest:
         assert data["model"] == "gpt-4"
         assert data["messages"][0]["role"] == "user"
 
+    def test_xtc_defaults_to_none(self):
+        """Test XTC params default to None (not sent by client)."""
+        req = ChatCompletionRequest(
+            model="gpt-4",
+            messages=[Message(role="user", content="Hello")],
+        )
+        assert req.xtc_probability is None
+        assert req.xtc_threshold is None
+
+    def test_xtc_accepted(self):
+        """Test XTC params are accepted in request."""
+        req = ChatCompletionRequest(
+            model="gpt-4",
+            messages=[Message(role="user", content="Hello")],
+            xtc_probability=0.5,
+            xtc_threshold=0.1,
+        )
+        assert req.xtc_probability == 0.5
+        assert req.xtc_threshold == 0.1
+
 
 class TestChatCompletionResponse:
     """Tests for ChatCompletionResponse model."""
@@ -502,6 +522,26 @@ class TestCompletionModels:
         assert isinstance(req.prompt, list)
         assert len(req.prompt) == 2
 
+    def test_completion_request_xtc_defaults_to_none(self):
+        """Test XTC params default to None on CompletionRequest."""
+        req = CompletionRequest(
+            model="gpt-3.5-turbo-instruct",
+            prompt="Hello",
+        )
+        assert req.xtc_probability is None
+        assert req.xtc_threshold is None
+
+    def test_completion_request_xtc_accepted(self):
+        """Test XTC params are accepted in CompletionRequest."""
+        req = CompletionRequest(
+            model="gpt-3.5-turbo-instruct",
+            prompt="Hello",
+            xtc_probability=0.3,
+            xtc_threshold=0.2,
+        )
+        assert req.xtc_probability == 0.3
+        assert req.xtc_threshold == 0.2
+
     def test_completion_response(self):
         """Test creating completion response."""
         resp = CompletionResponse(
@@ -563,3 +603,55 @@ class TestModelInfo:
         assert resp.object == "list"
         assert len(resp.data) == 2
         assert resp.data[0].id == "gpt-4"
+
+
+# =============================================================================
+# Stop Field Coercion
+# =============================================================================
+
+class TestStopCoercion:
+    """Tests for stop field string-to-list coercion (OpenAI compat)."""
+
+    def test_chat_stop_string_coerced_to_list(self):
+        """A bare string for stop should be wrapped in a list."""
+        req = ChatCompletionRequest(
+            model="m",
+            messages=[Message(role="user", content="hi")],
+            stop="<|endoftext|>",
+        )
+        assert req.stop == ["<|endoftext|>"]
+
+    def test_chat_stop_list_unchanged(self):
+        """A list value for stop should remain unchanged."""
+        req = ChatCompletionRequest(
+            model="m",
+            messages=[Message(role="user", content="hi")],
+            stop=["a", "b"],
+        )
+        assert req.stop == ["a", "b"]
+
+    def test_chat_stop_none_unchanged(self):
+        """None value for stop should remain None."""
+        req = ChatCompletionRequest(
+            model="m",
+            messages=[Message(role="user", content="hi")],
+        )
+        assert req.stop is None
+
+    def test_completion_stop_string_coerced_to_list(self):
+        """CompletionRequest stop string should also be coerced."""
+        req = CompletionRequest(
+            model="m",
+            prompt="hello",
+            stop="eos",
+        )
+        assert req.stop == ["eos"]
+
+    def test_completion_stop_list_unchanged(self):
+        """CompletionRequest stop list should remain unchanged."""
+        req = CompletionRequest(
+            model="m",
+            prompt="hello",
+            stop=["a"],
+        )
+        assert req.stop == ["a"]

@@ -249,6 +249,9 @@ class TestBlockAwarePrefixCache:
         assert stats.hits == 5
         assert stats.misses == 3
         assert stats.tokens_saved == 100
+        assert stats.partial_block_skips == 0
+        assert stats.partial_tokens_skipped == 0
+        assert stats.block_size == prefix_cache.block_size
 
     def test_get_stats_dict(self, prefix_cache):
         """Test getting statistics as dictionary."""
@@ -260,6 +263,9 @@ class TestBlockAwarePrefixCache:
         assert "hits" in stats_dict
         assert "misses" in stats_dict
         assert "hit_rate" in stats_dict
+        assert "partial_block_skips" in stats_dict
+        assert "partial_tokens_skipped" in stats_dict
+        assert "last_tokens_to_next_block" in stats_dict
         assert stats_dict["hit_rate"] == pytest.approx(10 / 15)
 
     def test_reset_stats(self, prefix_cache):
@@ -267,12 +273,20 @@ class TestBlockAwarePrefixCache:
         prefix_cache._hits = 10
         prefix_cache._misses = 5
         prefix_cache._tokens_saved = 500
+        prefix_cache._partial_block_skips = 3
+        prefix_cache._partial_tokens_skipped = 42
+        prefix_cache._last_partial_tokens_skipped = 2
+        prefix_cache._last_tokens_to_next_block = 254
 
         prefix_cache.reset_stats()
 
         assert prefix_cache._hits == 0
         assert prefix_cache._misses == 0
         assert prefix_cache._tokens_saved == 0
+        assert prefix_cache._partial_block_skips == 0
+        assert prefix_cache._partial_tokens_skipped == 0
+        assert prefix_cache._last_partial_tokens_skipped == 0
+        assert prefix_cache._last_tokens_to_next_block == 0
 
     def test_clear(self, prefix_cache, paged_cache):
         """Test clearing all cache data."""
@@ -489,6 +503,32 @@ class TestPrefixIndexOperations:
         assert result is not None
         prefix_len, matched_ids, num_blocks = result
         assert prefix_len == 4
+
+    def test_prefix_index_immutable_after_store(self, prefix_cache, paged_cache):
+        """Test that _prefix_index entries are not affected by later mutations
+        of the original block_ids list (e.g., from CoW or block reallocation).
+
+        Regression test for: storing a mutable list reference in _prefix_index
+        allows CoW operations to silently corrupt the index.
+        """
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]  # 2 blocks (block_size=4)
+
+        # Allocate blocks
+        blocks = paged_cache.get_new_blocks(2)
+        block_ids = [b.block_id for b in blocks]
+        original_ids = list(block_ids)  # snapshot for assertion
+
+        # Store into prefix index
+        prefix_cache._update_prefix_index(tokens, block_ids)
+
+        # Simulate CoW: mutate the original list in-place
+        block_ids[0] = 9999
+
+        # Verify: prefix_index must still contain the original block IDs
+        result = prefix_cache._find_best_prefix_match(tokens)
+        assert result is not None
+        _, matched_ids, num_blocks = result
+        assert list(matched_ids[:num_blocks]) == original_ids[:num_blocks]
 
 
 class TestValidateBlockCacheData:
@@ -854,6 +894,12 @@ class TestArraysCacheLastBlockOnly:
         # num_tokens should reflect only full blocks
         assert result.num_tokens == 8  # 2 blocks * 4 tokens
 
+        stats = cache.get_stats()
+        assert stats.partial_block_skips == 1
+        assert stats.partial_tokens_skipped == 2
+        assert stats.last_partial_tokens_skipped == 2
+        assert stats.last_tokens_to_next_block == 2
+
     def test_store_cache_arrayscache_partial_trailing_uses_last_full_block_state(self, mx):
         """ArraysCache with trailing partial tokens stores only full blocks safely."""
         from omlx.cache.hybrid_cache import ModelCacheConfig
@@ -934,6 +980,12 @@ class TestArraysCacheLastBlockOnly:
         assert result is not None
         assert len(result.block_ids) == 0
         assert result.num_tokens == 0
+
+        stats = cache.get_stats()
+        assert stats.partial_block_skips == 1
+        assert stats.partial_tokens_skipped == 3
+        assert stats.last_partial_tokens_skipped == 3
+        assert stats.last_tokens_to_next_block == 1
 
     def test_store_cache_exact_multiple_creates_all_blocks(self, mx):
         """Tokens exactly divisible by block_size should create all blocks."""

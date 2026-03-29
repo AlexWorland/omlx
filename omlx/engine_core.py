@@ -253,6 +253,10 @@ class EngineCore:
         vlm_inputs_embeds: Optional[Any] = None,
         vlm_extra_kwargs: Optional[Dict[str, Any]] = None,
         vlm_image_hash: Optional[str] = None,
+        specprefill: Optional[bool] = None,
+        specprefill_keep_pct: Optional[float] = None,
+        specprefill_threshold: Optional[int] = None,
+        specprefill_system_end: Optional[int] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -266,6 +270,9 @@ class EngineCore:
             vlm_inputs_embeds: Pre-computed vision+text embeddings for VLM
             vlm_extra_kwargs: Model-specific VLM kwargs (e.g., position_ids)
             vlm_image_hash: SHA256 hash of images for prefix cache
+            specprefill: Per-request SpecPrefill override (True/False/None)
+            specprefill_keep_pct: Per-request keep rate override
+            specprefill_threshold: Per-request threshold override (min tokens)
 
         Returns:
             The request ID
@@ -286,6 +293,20 @@ class EngineCore:
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
         )
+
+        # SpecPrefill: resolve per-request settings.
+        # The scheduler checks _specprefill_enabled to decide whether to score.
+        if specprefill is not None:
+            request._specprefill_enabled = specprefill
+        elif self.scheduler._specprefill_draft_model is not None:
+            # Draft model is loaded → enable by default
+            request._specprefill_enabled = True
+        if specprefill_keep_pct is not None:
+            request._specprefill_keep_pct = specprefill_keep_pct
+        if specprefill_threshold is not None:
+            request._specprefill_threshold = specprefill_threshold
+        if specprefill_system_end is not None and specprefill_system_end > 0:
+            request.specprefill_system_end = specprefill_system_end
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)
@@ -311,9 +332,31 @@ class EngineCore:
         the request ID into a thread-safe set. The actual abort is processed
         at the start of the next scheduler.step() call, ensuring it runs in
         the same execution context as generation (no race conditions).
+
+        Signals the consumer (stream_outputs/generate) with an abort error
+        so it can exit gracefully. Cleanup is handled by the consumer's
+        finally block, NOT here -- calling _cleanup_request() immediately
+        after put() would clear the output before the consumer can drain it.
         """
         result = self.scheduler.abort_request(request_id)
-        self._cleanup_request(request_id)
+
+        # Signal consumer with abort error so any waiting
+        # stream_outputs() / generate() can exit gracefully.
+        # Matches abort_all_requests() pattern.
+        collector = self._output_collectors.get(request_id)
+        if collector is not None:
+            collector.put(
+                RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="abort",
+                    error="Request aborted",
+                )
+            )
+        event = self._finished_events.get(request_id)
+        if event is not None:
+            event.set()
+
         return result
 
     async def abort_all_requests(self) -> int:
@@ -471,6 +514,7 @@ class EngineCore:
             # to free scheduler/GPU resources (prevents orphaned requests)
             logger.info(f"Request {request_id} cancelled, aborting")
             await self.abort_request(request_id)
+            self._cleanup_request(request_id)
             raise
 
         # Get the final output from collector

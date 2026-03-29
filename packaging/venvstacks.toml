@@ -14,16 +14,17 @@ name = "mlx-framework"
 runtime = "cpython-3.11"
 requirements = [
     # Core MLX
-    "mlx>=0.29.2",
-    # mlx-lm from latest commit (4a21ffd) - aligned with pyproject.toml
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4a21ffd",
-    # mlx-embeddings from latest commit (88522e2) - aligned with pyproject.toml
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@88522e288c0142170a5a44fd93c184d8ed777371",
+    "mlx==0.31.1",
+    # mlx-lm from latest commit (564281f) - aligned with pyproject.toml
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+    # mlx-embeddings from latest commit (32981fa) - aligned with pyproject.toml
+    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # Server dependencies
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
     # Tokenizers and transformers (aligned with pyproject.toml)
-    "transformers>=5.0.0",
+    # 5.4.0 broke VLM: Qwen2VLImageProcessor now hard-requires torch (#431)
+    "transformers>=5.0.0,<5.4.0",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     # Other dependencies
@@ -45,11 +46,24 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (348466f) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@348466f3f8f9a0413a6167bf8c1634d02ca2c131",
+    # mlx-vlm from commit (7f7a04c) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
     "Pillow>=9.0.0",
+    # Grammar-constrained decoding for structured output
+    "xgrammar>=0.1.32",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
+    # python-multipart needed by audio routes (File/Form uploads)
+    "python-multipart>=0.0.5",
+    # mlx-audio runtime deps (mlx-audio itself installed --no-deps in build.py)
+    "scipy>=1.11.0",
+    "librosa>=0.10.0",
+    "miniaudio>=1.59",
+    "numba>=0.59.0",
+    "pyloudnorm>=0.1.0",
+    "sounddevice>=0.4.6",
+    # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
+    # because mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm
 ]
 platforms = [
     "macosx_arm64",
@@ -65,6 +79,8 @@ dynlib_exclude = [
     "cv2/.dylibs/liblzma*",
     "cv2/.dylibs/libxcb*",
     "cv2/.dylibs/libXau*",
+    # torch's libomp conflicts with sklearn's — torch is stripped post-build anyway
+    "torch/lib/libomp*",
 ]
 
 [[applications]]
