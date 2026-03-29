@@ -29,19 +29,28 @@ except ImportError:
         pass
 
     # ── mlx stubs ──────────────────────────────────────────────────────
-    _make_stub("mlx", {"__path__": []})
-    _make_stub("mlx.core", {
+    _mlx = _make_stub("mlx", {"__path__": []})
+
+    _metal = _make_stub("mlx.core.metal", {"is_available": lambda: False})
+    _fast = _make_stub("mlx.core.fast", {})
+    _linalg = _make_stub("mlx.core.linalg", {})
+    _random = _make_stub("mlx.core.random", {})
+
+    _mx = _make_stub("mlx.core", {
         "Stream": type("Stream", (), {}),
         "array": type("array", (), {}),
         "float32": _DType(), "float16": _DType(), "bfloat16": _DType(),
         "int8": _DType(), "int16": _DType(), "int32": _DType(), "int64": _DType(),
         "uint8": _DType(), "uint16": _DType(), "uint32": _DType(), "uint64": _DType(),
         "bool_": _DType(),
+        # Wire submodules as attributes so mx.metal.is_available() works
+        "metal": _metal,
+        "fast": _fast,
+        "linalg": _linalg,
+        "random": _random,
     })
-    _make_stub("mlx.core.fast", {})
-    _make_stub("mlx.core.linalg", {})
-    _make_stub("mlx.core.random", {})
-    _make_stub("mlx.core.metal", {})
+    _mlx.core = _mx
+
     _make_stub("mlx.nn", {"Module": type("Module", (), {})})
     _make_stub("mlx.utils", {
         "tree_flatten": lambda *a, **k: [],
