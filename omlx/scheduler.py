@@ -2945,12 +2945,29 @@ class Scheduler:
                 except Exception as e:
                     logger.debug(f"SpecPrefill: draft cache fetch failed: {e}")
 
+            # Memory guard callback for draft model prefill chunks.
+            # Reuses the same soft/hard limit pattern as BatchGenerator.prefill().
+            mem_cb = None
+            if self._prefill_memory_guard and self._memory_hard_limit_bytes > 0:
+                hard = self._memory_hard_limit_bytes
+                soft = self._memory_limit_bytes
+                def mem_cb():
+                    active = mx.get_active_memory()
+                    if active > hard:
+                        raise RuntimeError("Memory limit exceeded during prefill")
+                    if soft > 0 and active > soft:
+                        logger.warning(
+                            f"Draft scoring memory soft limit: "
+                            f"{active / 1024**3:.1f}GB > {soft / 1024**3:.1f}GB"
+                        )
+
             t0 = time.monotonic()
             importance, used_cache = score_tokens(
                 self._specprefill_draft_model,
                 tokens_to_score,
                 prefill_step_size=self.config.prefill_step_size,
                 existing_cache=draft_cache,
+                memory_check_callback=mem_cb,
             )
             selected = select_chunks(importance, keep_pct=keep_pct)
             t_score = time.monotonic() - t0
@@ -3282,6 +3299,13 @@ class Scheduler:
         cached_tokens = request.cached_tokens or 0
         new_tokens = max(prompt_tokens - cached_tokens, 0)
 
+        # SpecPrefill reduces the actual KV cache footprint — use the
+        # effective token count (system full + selected sparse) instead
+        # of the full prompt to avoid false rejections.
+        if request.specprefill_indices is not None:
+            sys_remaining = getattr(request, '_specprefill_system_tokens', 0)
+            new_tokens = sys_remaining + len(request.specprefill_indices)
+
         if new_tokens == 0:
             return None
 
@@ -3493,6 +3517,25 @@ class Scheduler:
                     import time
                     t0 = time.monotonic()
 
+                    # Memory guard callback for SpecPrefill prefill chunks.
+                    # Shared by Phase 1 (system full prefill) and Phase 2 (sparse).
+                    mem_cb = None
+                    if self._prefill_memory_guard and self._memory_hard_limit_bytes > 0:
+                        hard = self._memory_hard_limit_bytes
+                        soft = self._memory_limit_bytes
+                        def mem_cb():
+                            active = mx.get_active_memory()
+                            if active > hard:
+                                raise RuntimeError(
+                                    "Memory limit exceeded during prefill"
+                                )
+                            if soft > 0 and active > soft:
+                                logger.warning(
+                                    f"SpecPrefill memory soft limit: "
+                                    f"{active / 1024**3:.1f}GB > "
+                                    f"{soft / 1024**3:.1f}GB"
+                                )
+
                     sp_cache = make_prompt_cache(self.model)
                     all_tokens = tokens_to_process
                     sys_count = getattr(request, '_specprefill_system_tokens', 0)
@@ -3506,6 +3549,8 @@ class Scheduler:
                             mx.eval([c.state for c in sp_cache])
                             sys_arr = sys_arr[step:]
                             mx.clear_cache()
+                            if mem_cb is not None:
+                                mem_cb()
                         if sys_arr.size > 0:
                             self.model(sys_arr[None], cache=sp_cache)
                             mx.eval([c.state for c in sp_cache])
@@ -3534,6 +3579,7 @@ class Scheduler:
                         sp_cache,
                         step_size=self.config.prefill_step_size,
                         position_offset=pos_offset,
+                        memory_check_callback=mem_cb,
                     )
                     # sparse_prefill installs _OffsetAdjustedRoPE with
                     # adjustment = M - N'. Subtract 1 to account for the

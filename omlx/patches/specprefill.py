@@ -198,7 +198,8 @@ def _unpatch_attention_capture(model, originals):
         _set_attn_module(model.layers[layer_idx], orig)
 
 
-def _prefill_draft(model, tokens, cache, step_size=2048):
+def _prefill_draft(model, tokens, cache, step_size=2048,
+                   memory_check_callback=None):
     """Prefill draft model with all prompt tokens. Returns last logits."""
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
     n = len(tokens)
@@ -209,6 +210,8 @@ def _prefill_draft(model, tokens, cache, step_size=2048):
         mx.eval([c.state for c in cache])
         processed += chunk
         mx.clear_cache()
+        if memory_check_callback is not None:
+            memory_check_callback()
     logits = model(prompt[processed:][None], cache=cache)
     mx.eval(logits)
     return logits
@@ -300,6 +303,7 @@ def score_tokens(
     prefill_step_size: int = 2048,
     query_extractor: Optional[Callable] = None,
     existing_cache: Optional[List[Any]] = None,
+    memory_check_callback: Optional[Callable[[], None]] = None,
 ) -> Tuple[mx.array, Any]:
     """Score token importance using attention patterns on a draft model.
 
@@ -352,14 +356,16 @@ def score_tokens(
         cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
         suffix = tokens[cached_len:]
         if suffix:
-            logits = _prefill_draft(model, suffix, cache, step_size=prefill_step_size)
+            logits = _prefill_draft(model, suffix, cache, step_size=prefill_step_size,
+                                    memory_check_callback=memory_check_callback)
         else:
             # Exact cache hit — run last token to get logits
             logits = model(mx.array([tokens[-1]])[None], cache=cache)
             mx.eval(logits)
     else:
         cache = make_prompt_cache(model)
-        logits = _prefill_draft(model, tokens, cache, step_size=prefill_step_size)
+        logits = _prefill_draft(model, tokens, cache, step_size=prefill_step_size,
+                                memory_check_callback=memory_check_callback)
 
     # Record cache offset before lookahead so we can trim afterwards.
     # Lookahead decode appends n_lookahead+1 tokens to the cache which
@@ -577,6 +583,7 @@ def sparse_prefill(
     cache,
     step_size: int = 2048,
     position_offset: int = 0,
+    memory_check_callback: Optional[Callable[[], None]] = None,
 ) -> mx.array:
     """Prefill model cache with selected tokens at their original positions.
 
@@ -592,6 +599,8 @@ def sparse_prefill(
         cache: list of KVCache from make_prompt_cache()
         step_size: chunk size for processing
         position_offset: added to positions for RoPE (e.g. system prompt cache)
+        memory_check_callback: optional callable invoked between prefill
+            chunks; should raise RuntimeError if memory limit is exceeded.
 
     Returns:
         logits from the last selected token
@@ -661,6 +670,8 @@ def sparse_prefill(
             mx.eval([c.state for c in cache])
             processed += chunk
             mx.clear_cache()
+            if memory_check_callback is not None:
+                memory_check_callback()
 
         # Last token -> logits
         logits = model(prompt[processed:][None], cache=cache)
